@@ -1746,7 +1746,7 @@ Respond now with actions or questions:"""
                 if not user_input:
                     continue
                 
-                if user_input.lower() in ['quit', 'bye'] and not self.is_root:
+                if user_input.lower() in ['quit','exit', 'bye'] and not self.is_root:
                     self.console.print("\n[cyan]Goodbye! 👋[/cyan]\n")
                     break
                 
