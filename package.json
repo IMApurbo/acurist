@@ -1,6 +1,6 @@
 {
   "name": "acurist",
-  "version": "1.2.2",
+  "version": "1.2.4",
   "description": "Claude-Code-style terminal agent UI for the Acurist local proxy",
   "type": "module",
   "author": "IMApurbo",
