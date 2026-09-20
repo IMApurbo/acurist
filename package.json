@@ -1,7 +1,7 @@
 {
   "name": "acurist",
-  "version": "1.2.4",
-  "description": "Claude-Code-style terminal agent UI for the Acurist local proxy",
+  "version": "1.2.5",
+  "description": "The ultimate penetration testing agent",
   "type": "module",
   "author": "IMApurbo",
   "license": "MIT",
