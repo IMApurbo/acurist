@@ -890,6 +890,7 @@ export class DeepTunnelServer {
     if (pathname === "/v1/models" && req.method === "GET") return this.handleModels(res);
     if (pathname === "/v1/messages" && req.method === "POST") return this.handleMessages(req, res);
     if (pathname === "/v1/messages/count_tokens" && req.method === "POST") return this.handleCountTokens(req, res);
+    if (pathname === "/rotate-token" && req.method === "POST") return this.handleRotateToken(res);
 
     res.writeHead(404);
     res.end("Not found");
@@ -897,6 +898,14 @@ export class DeepTunnelServer {
 
   private handleHealth(res: http.ServerResponse): void {
     json(res, { status: "ok", wasm: this.hasher ? "loaded" : "not loaded", tokens: this.tokenPool.size });
+  }
+
+  /** Called by proxyClient after a failed API call to rotate to the next token. */
+  private handleRotateToken(res: http.ServerResponse): void {
+    const newToken = this.tokenPool.rotate();
+    const hasToken = !!newToken;
+    process.stderr.write(`[deeptunnel] /rotate-token called — now on token index ${this.tokenPool.size > 1 ? "next" : "0 (only one)"}\n`);
+    json(res, { status: "ok", rotated: hasToken, pool_size: this.tokenPool.size });
   }
 
   private handleModels(res: http.ServerResponse): void {
