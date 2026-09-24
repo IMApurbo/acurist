@@ -9,6 +9,25 @@ export interface ProxyResponse {
   stopReason?: string;
 }
 
+// How long to wait before retrying after an API error (ms)
+const RETRY_DELAY_MS = 30_000;
+
+/** Signal the local proxy to rotate to the next token, if supported. */
+async function requestTokenRotation(baseUrl: string): Promise<void> {
+  const base = baseUrl.replace(/\/v1\/?$/, "");
+  try {
+    await fetch(`${base}/rotate-token`, {
+      method:  "POST",
+      headers: { "x-api-key": "local-proxy-key" },
+      signal:  AbortSignal.timeout(3000),
+    });
+    process.stderr?.write?.("[proxyClient] Requested token rotation from proxy.\n");
+  } catch {
+    // Proxy may not expose this endpoint — rotation is best-effort
+    process.stderr?.write?.("[proxyClient] Token rotation endpoint not available; proxy handles it internally.\n");
+  }
+}
+
 export class ProxyClient {
   constructor(private baseUrl: string, private model: string) {}
 
@@ -31,6 +50,48 @@ export class ProxyClient {
   }
 
   async ask(
+    messages: Message[],
+    system:   string,
+    signal?:  AbortSignal,
+    tools?:   object[],
+  ): Promise<ProxyResponse> {
+    // Attempt 1: normal call.
+    // On any error: wait 30 s, retry with the same token (attempt 2).
+    // If attempt 2 also fails: rotate to the next token and retry once more (attempt 3).
+    // If all three attempts fail, throw the last error.
+
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (signal?.aborted) throw Object.assign(new Error("Aborted"), { name: "AbortError" });
+
+      if (attempt === 2) {
+        // Wait 30 seconds before the first retry
+        process.stderr?.write?.(`[proxyClient] API error on attempt ${attempt - 1}. Waiting 30 s before retry…\n`);
+        await new Promise<void>((resolve, reject) => {
+          const tid = setTimeout(resolve, RETRY_DELAY_MS);
+          signal?.addEventListener("abort", () => { clearTimeout(tid); reject(Object.assign(new Error("Aborted"), { name: "AbortError" })); }, { once: true });
+        });
+      } else if (attempt === 3) {
+        // Second retry: rotate the token first
+        process.stderr?.write?.("[proxyClient] Attempt 2 also failed. Rotating token and retrying…\n");
+        await requestTokenRotation(this.baseUrl);
+      }
+
+      try {
+        const result = await this._askOnce(messages, system, signal, tools);
+        return result;
+      } catch (e: any) {
+        if (e?.name === "AbortError") throw e;
+        lastError = e;
+        process.stderr?.write?.(`[proxyClient] Attempt ${attempt} failed: ${e?.message}\n`);
+      }
+    }
+
+    throw lastError;
+  }
+
+  private async _askOnce(
     messages: Message[],
     system:   string,
     signal?:  AbortSignal,
