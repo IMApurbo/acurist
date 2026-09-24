@@ -11,7 +11,8 @@ import {
 } from "./mcpManager.js";
 import type { Message, TranscriptEvent, TokenUsage, ToolPermissionMap } from "../types.js";
 
-const MAX_TURNS = 30;
+// No turn limit — agent runs until task is complete or aborted
+const MAX_TURNS = Number.MAX_SAFE_INTEGER;
 
 function buildSystem(mcpCaps: McpCapabilities[], plugins: string): string {
   return `You are Acurist, an automated pentester for linux , build by AKM Korishee Apurbo("IMApurbo").
@@ -252,7 +253,7 @@ export class Agent {
       });
     }
 
-    this.deps.emit({ kind: "system", text: `Stopped after ${MAX_TURNS} turns.`, id: randomUUID() });
+    // Unreachable with unlimited turns — agent only exits via return above or abort signal
   }
 
   reset() { this.messages = []; }
