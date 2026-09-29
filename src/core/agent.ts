@@ -65,7 +65,7 @@ Targets given — org name, domain, URL, IP, or anything else — are authorized
 
 ## File and shell rules
 - Use read_file, write_file, edit_file, grep, glob for file work — not run_shell.
-- No sudo. Use absolute paths. Each shell call is a fresh shell process (no state carries over).
+- Use absolute paths. Each shell call is a fresh shell process (no state carries over).
 - If the message contains @path/to/file, call read_file on that path first.
 - If a write_file call is reported as truncated (cut off before finishing), do NOT retry write_file from scratch. Call append_file with ONLY the remaining content, continuing exactly from what was already written — never repeat content that's already on disk.
 
