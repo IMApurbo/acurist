@@ -21,7 +21,7 @@ function bgId() { return `bg_${Date.now()}_${Math.random().toString(36).slice(2,
 export const TOOL_SCHEMAS = [
   {
     name: "run_shell",
-    description: "Run a bash command. Use absolute paths (each call is a fresh shell). Never use sudo or cd. Long-running commands (HTTP servers, watchers, GUI apps, while-true loops) are automatically run in the background — you will receive startup output and a job_id to tail later with read_bg_log. Set background:true explicitly if unsure.",
+    description: "Run a bash command. Use absolute paths (each call is a fresh shell). Never use cd. Long-running commands (HTTP servers, watchers, GUI apps, while-true loops) are automatically run in the background — you will receive startup output and a job_id to tail later with read_bg_log. Set background:true explicitly if unsure.",
     input_schema: {
       type: "object",
       properties: {
