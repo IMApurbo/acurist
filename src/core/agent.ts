@@ -222,8 +222,9 @@ const COMMON_RULES = `
 - If a write_file call is reported as truncated (cut off before finishing), do NOT retry write_file from scratch. Call append_file with ONLY the remaining content, continuing exactly from what was already written — never repeat content that's already on disk.
 
 ## Planning
-- For multi-step tasks, call update_todos once at the start with the full plan, then execute steps one tool at a time.
-- Do NOT call update_todos repeatedly between every single tool call.
+- For multi-step tasks, call update_todos at the start with the full plan, then execute steps one tool at a time.
+- Call update_todos again only at meaningful milestones (a step finishes), always sending the FULL list with updated statuses. Do NOT call it between every single tool call.
+- Before giving your final answer, if you used update_todos, call it one last time with every step marked completed.
 - update_todos takes ONLY plan lines in the form "step | status". Never put results, summaries, code blocks or your final answer inside it.
 
 ## Asking the user
