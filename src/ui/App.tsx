@@ -125,7 +125,10 @@ export default function App({ config }: { config: AgentConfig }) {
 
   const emit = useCallback((event: TranscriptEvent) => {
     if (event.kind === "todos") {
-      // Sticky panel: replace the previous list, don't append to scrollback
+      // Sticky panel: replace the previous list, don't append to scrollback.
+      // Ignore late updates from a run that was interrupted or already ended,
+      // otherwise the panel gets resurrected with nothing left to clear it.
+      if (!processingQueueRef.current) return;
       setTodos(event.todos);
       return;
     }
@@ -778,6 +781,8 @@ export default function App({ config }: { config: AgentConfig }) {
       } finally {
         abortRef.current = null;
         processingQueueRef.current = false;
+        // Run finished (or was interrupted) → drop the sticky todo panel
+        setTodos([]);
         // Drain any queued messages after this one finishes
         await drainQueue();
       }
@@ -1022,6 +1027,7 @@ export default function App({ config }: { config: AgentConfig }) {
           setMode({ kind: "idle" });
           setActiveToolName(null);
           processingQueueRef.current = false;
+          setTodos([]);
           emit({ kind: "system", id: randomUUID(), text: "⏹ Interrupted. Message queue cleared. (Ctrl+C again to quit)" });
           ctrlCPressedRef.current = false;
           setExitHint(false);
@@ -1076,6 +1082,7 @@ export default function App({ config }: { config: AgentConfig }) {
           setMode({ kind: "idle" });
           setActiveToolName(null);
           processingQueueRef.current = false;
+          setTodos([]);
           emit({ kind: "system", id: randomUUID(), text: "⏹ Interrupted. Message queue cleared." });
         }
         return;
