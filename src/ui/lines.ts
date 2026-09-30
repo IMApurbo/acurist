@@ -4,6 +4,8 @@ import type { TranscriptEvent } from "../types.js";
 import { renderMarkdown } from "./markdown.js";
 import { buildBannerLines } from "./banner.js";
 import { parseTodoString } from "../core/todoParse.js";
+import { readFullOutput } from "../core/outputLog.js";
+import fs from "node:fs";
 
 // ── scrollback line model ────────────────────────────────────────────
 function wrapLine(text: string, width: number): string[] {
@@ -27,7 +29,7 @@ function trunc(s: string, maxLen: number): string {
  * ⏺ grep        "TODO" in src/
  * ⏺ web_fetch   https://example.com
  */
-function toolCallLine(name: string, input: Record<string, any>, width: number): string[] {
+function toolCallLine(name: string, input: Record<string, any>, width: number, expanded = false): string[] {
   const PREFIX = "⏺ ";
 
   // Primary value — what you'd show right next to the tool name
@@ -96,9 +98,9 @@ function toolCallLine(name: string, input: Record<string, any>, width: number): 
       primary = JSON.stringify(input);
   }
 
-  // Available width for the value portion after "⏺ toolname  "
+  // Available width for the value portion after "⏺ toolname  " (2 cols reserved for the ▸/▾ marker)
   const nameTag = `${PREFIX}${name}  `;
-  const remaining = Math.max(20, width - nameTag.length);
+  const remaining = Math.max(20, width - nameTag.length - 2);
 
   // If secondary fits, show "primary  secondary"; else just primary
   let valueStr: string;
@@ -110,8 +112,31 @@ function toolCallLine(name: string, input: Record<string, any>, width: number): 
     valueStr = chalk.bold(trunc(primary, remaining));
   }
 
-  const line = chalk.magenta(PREFIX + chalk.magenta.bold(name) + "  ") + chalk.white(valueStr);
-  return ["", ...wrapLine(line, width)];
+  const marker = chalk.cyan.dim(expanded ? " ▾" : " ▸");
+  const line = chalk.magenta(PREFIX + chalk.magenta.bold(name) + "  ") + chalk.white(valueStr) + marker;
+  const out = ["", ...wrapLine(line, width)];
+  if (!expanded) return out;
+
+  // Expanded: the complete, untruncated tool call — every argument in full.
+  const IND = "    ";
+  const CAP = 200; // per-argument line cap (a write_file body can be huge)
+  const entries = Object.entries(input ?? {});
+  if (entries.length === 0) out.push(IND + chalk.dim("(no arguments)"));
+  for (const [k, v] of entries) {
+    const raw = typeof v === "string" ? v : (JSON.stringify(v, null, 2) ?? String(v));
+    const vLines = raw.replace(/\r/g, "").replace(/\t/g, "  ").split("\n");
+    const key = chalk.cyan(k + ":");
+    if (vLines.length === 1 && k.length + 2 + vLines[0].length <= width - IND.length) {
+      out.push(IND + key + " " + chalk.white(vLines[0]));
+      continue;
+    }
+    out.push(IND + key);
+    for (const l of vLines.slice(0, CAP)) {
+      for (const seg of wrapLine(l, Math.max(1, width - IND.length - 2))) out.push(IND + "  " + chalk.white(seg));
+    }
+    if (vLines.length > CAP) out.push(IND + "  " + chalk.dim(`… +${vLines.length - CAP} more lines`));
+  }
+  return out;
 }
 
 /**
@@ -119,20 +144,47 @@ function toolCallLine(name: string, input: Record<string, any>, width: number): 
  * Long output gets the truncation hint already baked in by outputLog.ts
  * (previewOrLog). Here we just render what we received.
  */
-function toolResultLines(output: string, isError: boolean, width: number): string[] {
-  const prefix = isError ? chalk.red("✗ ") : chalk.gray("⎿ ");
-  const body = output.trim() || "(empty)";
-  const lines = body.split("\n");
+function toolResultLines(
+  output: string,
+  isError: boolean,
+  width: number,
+  opts: { expandable: boolean; expanded: boolean; logPath?: string } = { expandable: false, expanded: false },
+): string[] {
+  const color = (t: string) => (isError ? chalk.red(t) : chalk.gray(t));
+  const full = opts.expanded && opts.logPath ? readFullOutput(opts.logPath) : null;
+  const body = (full ?? output).trim() || "(empty)";
 
-  return lines.map((line, i) => {
-    const pfx = i === 0 ? prefix : "  ";
-    const colored = isError ? chalk.red(pfx + line) : chalk.gray(pfx + line);
-    return "  " + colored;
+  // Every rendered row must be exactly one terminal row (the scroll/selection
+  // math depends on it), so long lines are hard-wrapped rather than left to
+  // the terminal.
+  const rows: string[] = [];
+  body.split("\n").forEach((line, i) => {
+    const clean = line.replace(/\r/g, "").replace(/\t/g, "    ");
+    wrapLine(clean, Math.max(1, width - 4)).forEach((seg, j) => {
+      const pfx = i === 0 && j === 0 ? (isError ? "✗ " : "⎿ ") : "  ";
+      rows.push("  " + color(pfx + seg));
+    });
   });
+
+  if (opts.expandable) {
+    rows.push("    " + chalk.cyan.dim(opts.expanded ? "▾ click to collapse" : "▸ click to expand full output"));
+  }
+  return rows;
+}
+
+/**
+ * Whether clicking this event toggles anything: every tool call (full
+ * arguments), and tool results whose output was truncated (full text is in a
+ * log file). Results with a missing log file (e.g. a loaded session) aren't.
+ */
+export function isToggleable(event: TranscriptEvent): boolean {
+  if (event.kind === "tool_call") return true;
+  if (event.kind === "tool_result") return !!event.logPath && fs.existsSync(event.logPath);
+  return false;
 }
 
 /** Renders one transcript event into the exact terminal rows it occupies. */
-export function eventToLines(event: TranscriptEvent, width: number): string[] {
+export function eventToLines(event: TranscriptEvent, width: number, expanded = false): string[] {
   switch (event.kind) {
     case "user": {
       const line = chalk.green.bold(`› ${event.text}`);
@@ -145,11 +197,15 @@ export function eventToLines(event: TranscriptEvent, width: number): string[] {
     }
 
     case "tool_call": {
-      return toolCallLine(event.name, event.input as Record<string, any>, width);
+      return toolCallLine(event.name, event.input as Record<string, any>, width, expanded);
     }
 
     case "tool_result": {
-      return toolResultLines(event.output, event.isError, width);
+      return toolResultLines(event.output, event.isError, width, {
+        expandable: isToggleable(event),
+        expanded,
+        logPath: event.logPath,
+      });
     }
 
     case "todos": {

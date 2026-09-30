@@ -7,7 +7,7 @@ import path from "node:path";
 import fetch from "node-fetch";
 import type { ProxyClient } from "./proxyClient.js";
 import type { ToolPermissionMap } from "../types.js";
-import { parseTodoString } from "./todoParse.js";
+import { parseTodoString, normalizeTodoArray } from "./todoParse.js";
 
 const execAsync = promisify(exec);
 
@@ -232,21 +232,79 @@ async function walk(dir: string, out: string[], depth = 0): Promise<void> {
   }
 }
 
+/** Like walk(), but also accepts a single FILE as the base (grep/glob on one file). */
+async function collectFiles(base: string): Promise<{ files: string[]; root: string }> {
+  const st = await fs.stat(base); // throws ENOENT with a clear message
+  if (st.isFile()) return { files: [base], root: path.dirname(base) };
+  const files: string[] = [];
+  await walk(base, files);
+  return { files, root: base };
+}
+
+const toPosix = (p: string) => p.split(path.sep).join("/");
+
+/** Coerce a model-supplied number (models sometimes send "10" or 10.5). */
+function toInt(v: unknown, dflt: number, min = 0): number {
+  const n = typeof v === "string" ? parseInt(v, 10) : typeof v === "number" ? Math.trunc(v) : NaN;
+  return Number.isFinite(n) ? Math.max(min, n) : dflt;
+}
+
+/**
+ * Glob → anchored RegExp over a POSIX-style relative path.
+ * Supports **, *, ?, {a,b}, [abc]. A pattern with no "/" matches at any depth
+ * (ripgrep/gitignore behaviour), so "*.ts" finds src/a.ts too.
+ */
 function globRe(pattern: string): RegExp {
-  const escaped = pattern
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*\*/g, "\u0000").replace(/\*/g, "[^/]*")
-    .replace(/\u0000/g, ".*").replace(/\?/g, ".");
-  return new RegExp(`${escaped}$`);
+  let pat = pattern.replace(/\\/g, "/").replace(/^\.\//, "");
+  if (!pat.includes("/")) pat = "**/" + pat;
+  let re = "", braceDepth = 0;
+  for (let i = 0; i < pat.length; i++) {
+    const c = pat[i];
+    if (c === "*") {
+      if (pat[i + 1] === "*") {
+        i++;
+        if (pat[i + 1] === "/") { i++; re += "(?:.*/)?"; } // "**/" = zero or more dirs
+        else re += ".*";
+      } else re += "[^/]*";
+    }
+    else if (c === "?") re += "[^/]";
+    else if (c === "{") { braceDepth++; re += "(?:"; }
+    else if (c === "}" && braceDepth > 0) { braceDepth--; re += ")"; }
+    else if (c === "," && braceDepth > 0) re += "|";
+    else if (c === "[") { const end = pat.indexOf("]", i + 1); if (end > i) { re += pat.slice(i, end + 1); i = end; } else re += "\\["; }
+    else re += c.replace(/[.+^${}()|\\\]]/g, "\\$&");
+  }
+  return new RegExp(`^${re}$`);
 }
 
 // ── Tool implementations ──────────────────────────────────────────────────────
 
+const MAX_READ_CHARS = 120_000;
+const MAX_LINE_CHARS = 2_000;
+
 async function readFile(ctx: ToolContext, input: any): Promise<string> {
-  const lines  = (await fs.readFile(abs(ctx.cwd, input.path), "utf-8")).split("\n");
-  const offset = Math.max(1, input.offset ?? 1);
-  const limit  = input.limit ?? 2000;
-  return lines.slice(offset - 1, offset - 1 + limit).map((l, i) => `${offset + i}\t${l}`).join("\n");
+  if (typeof input.path !== "string" || !input.path) throw new Error("read_file requires a non-empty string path");
+  const full = abs(ctx.cwd, input.path);
+  const st = await fs.stat(full);
+  if (st.isDirectory()) throw new Error(`${full} is a directory — use list_dir`);
+  const buf = await fs.readFile(full);
+  if (buf.subarray(0, 8192).includes(0)) throw new Error(`${full} looks like a binary file (${buf.length} bytes) — not reading it as text`);
+  const lines  = buf.toString("utf-8").split("\n");
+  const offset = toInt(input.offset, 1, 1);
+  const limit  = toInt(input.limit, 2000, 1);
+
+  const out: string[] = [];
+  let chars = 0, i = 0;
+  for (; i < limit && offset - 1 + i < lines.length; i++) {
+    let l = lines[offset - 1 + i].replace(/\r$/, "");
+    if (l.length > MAX_LINE_CHARS) l = l.slice(0, MAX_LINE_CHARS) + `… [+${l.length - MAX_LINE_CHARS} chars truncated]`;
+    const row = `${offset + i}\t${l}`;
+    if (chars + row.length > MAX_READ_CHARS) break;
+    out.push(row); chars += row.length + 1;
+  }
+  const next = offset + i;
+  if (next <= lines.length && i > 0) out.push(`… [stopped at line ${next - 1} of ${lines.length}; call read_file with offset=${next} to continue]`);
+  return out.join("\n");
 }
 
 /**
@@ -288,17 +346,64 @@ async function askFullText(
     // own (unfinished) turn, then re-ask on the same conversation. The
     // model picks up mid-stream using its previous output as context,
     // instead of starting over.
+    // The API rejects an assistant prefill ending in whitespace, so trim it;
+    // the model re-emits any needed newline when it continues.
+    const prefill = acc.replace(/\s+$/, "");
+    if (!prefill) return { text: acc, truncated: true };
+    acc = prefill;
     messages = [
-      ...messages,
-      { role: "assistant", content: [{ type: "text", text: acc }] },
+      messages[0],
+      { role: "assistant", content: [{ type: "text", text: prefill }] },
     ];
   }
 
   return { text: acc, truncated: true };
 }
 
-function stripFences(text: string): string {
-  return text.trim().replace(/^```[a-zA-Z0-9]*\r?\n?/, "").replace(/\n?```\s*$/, "");
+/**
+ * Turn raw model output into the new file content WITHOUT damaging it.
+ * - Only unwraps a fence when the WHOLE reply is one fenced block (never trims
+ *   the file's own leading indentation / blank lines).
+ * - Skips unwrapping if the original file itself starts with a fence (e.g. .md).
+ * - Restores the original's line endings (CRLF) and trailing newline, which
+ *   models routinely drop.
+ */
+function cleanModelFile(text: string, original: string): string {
+  let out = text;
+  if (!/^\s*```/.test(original)) {
+    const m = out.match(/^\s*```[a-zA-Z0-9_+-]*[ \t]*\r?\n([\s\S]*?)\r?\n?```\s*$/);
+    if (m) out = m[1];
+  }
+  const origCRLF = original.includes("\r\n");
+  if (origCRLF && !out.includes("\r\n")) out = out.replace(/\n/g, "\r\n");
+  const eol = origCRLF ? "\r\n" : "\n";
+  const origEndsNL = /\n$/.test(original);
+  if (origEndsNL && !/\n$/.test(out)) out += eol;
+  if (!origEndsNL && /\n$/.test(out)) out = out.replace(/\r?\n+$/, "");
+  return out;
+}
+
+/** Refuse rewrites that look like the model answered with prose instead of a file. */
+function assertPlausibleRewrite(kind: string, full: string, original: string, next: string) {
+  if (!next.trim()) throw new Error(`Model returned no content for ${kind}`);
+  if (original.length > 200 && next.length < original.length * 0.3) {
+    throw new Error(
+      `${kind} for ${full} would shrink the file from ${original.length} to ${next.length} chars ` +
+      `(<30%). This usually means the model replied with an explanation instead of the full file. ` +
+      `Refusing to overwrite. Retry with a more specific instruction or use write_file.`
+    );
+  }
+}
+
+async function assertUnchangedOnDisk(full: string, mtimeMs: number, kind: string) {
+  const st = await fs.stat(full);
+  if (st.mtimeMs !== mtimeMs) {
+    throw new Error(`${kind}: ${full} was modified while the edit was being generated. Re-read the file and retry.`);
+  }
+}
+
+async function confirmWrite(ctx: ToolContext, tool: string, detail: string): Promise<boolean> {
+  return ctx.confirmShell(detail, tool);
 }
 
 async function writeFile(ctx: ToolContext, input: any): Promise<string> {
@@ -308,10 +413,12 @@ async function writeFile(ctx: ToolContext, input: any): Promise<string> {
       `This usually means the model's tool call was truncated or malformed — refusing to write.`
     );
   }
+  if (typeof input.path !== "string" || !input.path) throw new Error("write_file requires a non-empty string path");
   const full = abs(ctx.cwd, input.path);
+  if (!(await confirmWrite(ctx, "write_file", `write_file ${full} (${input.content.split("\n").length} lines)`))) return "Cancelled by user.";
   await fs.mkdir(path.dirname(full), { recursive: true });
   await fs.writeFile(full, input.content, "utf-8");
-  return `Wrote ${input.content.length} bytes to ${full}`;
+  return `Wrote ${Buffer.byteLength(input.content)} bytes to ${full}`;
 }
 
 /** Append content to an existing file (or create it). Used to continue a
@@ -324,15 +431,19 @@ async function appendFile(ctx: ToolContext, input: any): Promise<string> {
       `The continuation call may itself have been truncated or malformed — refusing to append.`
     );
   }
+  if (typeof input.path !== "string" || !input.path) throw new Error("append_file requires a non-empty string path");
   const full = abs(ctx.cwd, input.path);
+  if (!(await confirmWrite(ctx, "append_file", `append_file ${full} (+${input.content.split("\n").length} lines)`))) return "Cancelled by user.";
   await fs.mkdir(path.dirname(full), { recursive: true });
   await fs.appendFile(full, input.content, "utf-8");
   const stat = await fs.stat(full);
-  return `Appended ${input.content.length} bytes to ${full} (file is now ${stat.size} bytes total).`;
+  return `Appended ${Buffer.byteLength(input.content)} bytes to ${full} (file is now ${stat.size} bytes total).`;
 }
 
 async function editFile(ctx: ToolContext, input: any): Promise<string> {
+  if (typeof input.path !== "string" || !input.path) throw new Error("edit_file requires a non-empty string path");
   const full     = abs(ctx.cwd, input.path);
+  const { mtimeMs } = await fs.stat(full);
   const original = await fs.readFile(full, "utf-8");
   const prompt   =
     `Apply this instruction and return ONLY the complete new file content — no commentary, no fences.\n\nInstruction: ${input.instruction}\n\n--- FILE (${input.path}) ---\n${original}`;
@@ -341,8 +452,6 @@ async function editFile(ctx: ToolContext, input: any): Promise<string> {
     ctx, prompt,
     "You are a precise code-editing engine. Output only the full resulting file.",
   );
-  const cleaned = stripFences(text);
-  if (!cleaned) throw new Error("Model returned no content for edit_file");
   if (truncated) {
     throw new Error(
       `edit_file for ${full} was still truncated after multiple continuation attempts. ` +
@@ -350,8 +459,13 @@ async function editFile(ctx: ToolContext, input: any): Promise<string> {
       `Try a smaller, more targeted instruction or split the edit into steps.`
     );
   }
+  const cleaned = cleanModelFile(text, original);
+  assertPlausibleRewrite("edit_file", full, original, cleaned);
+  if (cleaned === original) return `No changes made to ${full} (model returned identical content).`;
+  if (!(await confirmWrite(ctx, "edit_file", unifiedDiff(original, cleaned, input.path)))) return "Edit rejected.";
+  await assertUnchangedOnDisk(full, mtimeMs, "edit_file");
   await fs.writeFile(full, cleaned, "utf-8");
-  return `Edited ${full} (${cleaned.length} bytes)`;
+  return `Edited ${full} (${Buffer.byteLength(cleaned)} bytes)`;
 }
 
 function unifiedDiff(oldText: string, newText: string, filePath: string): string {
@@ -391,63 +505,51 @@ function unifiedDiff(oldText: string, newText: string, filePath: string): string
   }
   tokens.reverse();
 
-  // Check if there are any actual changes
-  if (!tokens.some(t => t.tag !== " ")) return "(no changes)";
+  const changed: number[] = [];
+  tokens.forEach((t, idx) => { if (t.tag !== " ") changed.push(idx); });
+  if (changed.length === 0) return "(no changes)";
 
-  // Emit hunks with correct @@ -oldStart,oldCount +newStart,newCount @@ headers
+  // Prefix line counters: oldAt[k] / newAt[k] = 1-based line numbers of token k
+  const oldAt: number[] = [], newAt: number[] = [];
+  { let o = 1, n = 1;
+    for (const t of tokens) { oldAt.push(o); newAt.push(n); if (t.tag !== "+") o++; if (t.tag !== "-") n++; } }
+
+  // Group changes into hunks; merge groups whose context would touch/overlap
   const CONTEXT = 3;
-  const result: string[] = [...header];
-  let oldLine = 1, newLine = 1, ti = 0;
-
-  while (ti < tokens.length) {
-    // Skip context-only stretches to find next changed region
-    if (tokens[ti].tag === " ") { oldLine++; newLine++; ti++; continue; }
-
-    // Found a changed token — define hunk boundaries
-    const hunkStart = Math.max(0, ti - CONTEXT);
-    const hunkTokens: Token[] = [];
-
-    // Collect until CONTEXT lines after last change
-    let lastChanged = ti;
-    let k = hunkStart;
-    while (k < tokens.length) {
-      hunkTokens.push(tokens[k]);
-      if (tokens[k].tag !== " ") lastChanged = k;
-      if (k > lastChanged + CONTEXT) break;
-      k++;
-    }
-
-    // Compute old/new line numbers at hunk start
-    let oldStartLine = 1, newStartLine = 1;
-    for (let m = 0; m < hunkStart; m++) {
-      if (tokens[m].tag !== "+") oldStartLine++;
-      if (tokens[m].tag !== "-") newStartLine++;
-    }
-
-    const oldCount = hunkTokens.filter(t => t.tag !== "+").length;
-    const newCount = hunkTokens.filter(t => t.tag !== "-").length;
-
-    result.push(`@@ -${oldStartLine},${oldCount} +${newStartLine},${newCount} @@`);
-    for (const t of hunkTokens) result.push(`${t.tag}${t.text}`);
-
-    ti = lastChanged + CONTEXT + 1;
+  const ranges: [number, number][] = [];
+  for (const c of changed) {
+    const lo = Math.max(0, c - CONTEXT), hi = Math.min(tokens.length - 1, c + CONTEXT);
+    const last = ranges[ranges.length - 1];
+    if (last && lo <= last[1] + 1) last[1] = Math.max(last[1], hi);
+    else ranges.push([lo, hi]);
   }
 
+  const result: string[] = [...header];
+  for (const [lo, hi] of ranges) {
+    const slice = tokens.slice(lo, hi + 1);
+    const oldCount = slice.filter(t => t.tag !== "+").length;
+    const newCount = slice.filter(t => t.tag !== "-").length;
+    // Unified-diff convention: an empty side reports start-1
+    const oldStart = oldCount === 0 ? oldAt[lo] - 1 : oldAt[lo];
+    const newStart = newCount === 0 ? newAt[lo] - 1 : newAt[lo];
+    result.push(`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`);
+    for (const t of slice) result.push(`${t.tag}${t.text}`);
+  }
   return result.join("\n");
 }
 
 async function diffFile(ctx: ToolContext, input: any): Promise<string> {
+  if (typeof input.path !== "string" || !input.path) throw new Error("diff_file requires a non-empty string path");
   const full     = abs(ctx.cwd, input.path);
+  const { mtimeMs } = await fs.stat(full);
   const original = await fs.readFile(full, "utf-8");
   const prompt   =
-    `Apply this instruction and return ONLY the complete new file content.\n\nInstruction: ${input.instruction}\n\n--- FILE (${input.path}) ---\n${original}`;
+    `Apply this instruction and return ONLY the complete new file content — no commentary, no fences.\n\nInstruction: ${input.instruction}\n\n--- FILE (${input.path}) ---\n${original}`;
 
   const { text, truncated } = await askFullText(
     ctx, prompt,
     "You are a precise code-editing engine. Output only the full resulting file.",
   );
-  const newContent = stripFences(text);
-  if (!newContent) throw new Error("Model returned no content for diff_file");
   if (truncated) {
     throw new Error(
       `diff_file for ${full} was still truncated after multiple continuation attempts. ` +
@@ -455,49 +557,68 @@ async function diffFile(ctx: ToolContext, input: any): Promise<string> {
       `Try a smaller, more targeted instruction or split the edit into steps.`
     );
   }
+  const newContent = cleanModelFile(text, original);
+  assertPlausibleRewrite("diff_file", full, original, newContent);
+  if (newContent === original) return `No changes: model returned identical content for ${full}.`;
   const diff = unifiedDiff(original, newContent, input.path);
 
-  // Resolve permission: per-tool override → global wildcard → global mode (default auto)
-  const perm = ctx.toolPermissions?.["diff_file"] ?? ctx.toolPermissions?.["*"];
-  // diff_file has no standalone globalMode concept in ctx; default to auto (same as run_shell auto mode)
-  const mode = perm ?? "auto";
-
-  if (mode === "auto" || await ctx.confirmShell(diff, "diff_file")) {
+  // confirmShell resolves per-tool override → global mode (auto/manual) itself.
+  // (Previously this defaulted to "auto" here, so manual mode never prompted.)
+  if (await ctx.confirmShell(diff, "diff_file")) {
+    await assertUnchangedOnDisk(full, mtimeMs, "diff_file");
     await fs.writeFile(full, newContent, "utf-8");
     return `Applied diff to ${full}\n${diff}`;
   }
   return `Diff rejected.\n${diff}`;
 }
 
+const MAX_GREP_MATCHES = 300;
+const MAX_GREP_FILE_BYTES = 2_000_000;
+const MAX_GLOB_RESULTS = 500;
+
 async function grep(ctx: ToolContext, input: any): Promise<string> {
-  const base  = abs(ctx.cwd, input.path || ".");
-  const files: string[] = [];
-  await walk(base, files);
-  const globFilter = input.glob ? globRe(input.glob) : null;
+  if (typeof input.pattern !== "string" || !input.pattern) throw new Error("grep requires a non-empty string pattern");
+  const base = abs(ctx.cwd, input.path || ".");
+  const { files, root } = await collectFiles(base);
+  const globFilter = input.glob ? globRe(String(input.glob)) : null;
   const pattern    = new RegExp(input.pattern);
   const matches: string[] = [];
+  let capped = false;
+  outer:
   for (const f of files) {
-    if (globFilter && !globFilter.test(f.replace(base + path.sep, "").replace(/\\/g, "/"))) continue;
+    if (globFilter && !globFilter.test(toPosix(path.relative(root, f)))) continue;
     let content: string;
-    try { content = await fs.readFile(f, "utf-8"); } catch { continue; }
-    content.split("\n").forEach((l, i) => {
-      if (pattern.test(l)) matches.push(`${f}:${i+1}:${l.trim()}`);
-    });
-    if (matches.length > 300) break;
+    try {
+      const st = await fs.stat(f);
+      if (st.size > MAX_GREP_FILE_BYTES) continue;
+      const buf = await fs.readFile(f);
+      if (buf.subarray(0, 4096).includes(0)) continue; // binary
+      content = buf.toString("utf-8");
+    } catch { continue; }
+    const ls = content.split("\n");
+    for (let i = 0; i < ls.length; i++) {
+      if (!pattern.test(ls[i])) continue;
+      const t = ls[i].trim();
+      matches.push(`${f}:${i + 1}:${t.length > 300 ? t.slice(0, 300) + "…" : t}`);
+      if (matches.length >= MAX_GREP_MATCHES) { capped = true; break outer; }
+    }
   }
-  return matches.length ? matches.slice(0, 300).join("\n") : "(no matches)";
+  if (!matches.length) return "(no matches)";
+  return matches.join("\n") + (capped ? `\n… stopped at ${MAX_GREP_MATCHES} matches — narrow the pattern, path or glob` : "");
 }
 
 async function glob(ctx: ToolContext, input: any): Promise<string> {
+  if (typeof input.pattern !== "string" || !input.pattern) throw new Error("glob requires a non-empty string pattern");
   const base = abs(ctx.cwd, input.path || ".");
-  const files: string[] = [];
-  await walk(base, files);
+  const { files, root } = await collectFiles(base);
   const re = globRe(input.pattern);
-  const candidates = files.filter(f => re.test(f.replace(base + path.sep, "")));
+  const candidates = files.filter(f => re.test(toPosix(path.relative(root, f))));
   const settled = await Promise.allSettled(candidates.map(async f => ({ f, mtime: (await fs.stat(f)).mtimeMs })));
   const valid = settled.filter((r): r is PromiseFulfilledResult<{ f: string; mtime: number }> => r.status === "fulfilled").map(r => r.value);
   valid.sort((a, b) => b.mtime - a.mtime);
-  return valid.length ? valid.map(x => x.f).join("\n") : "(no matches)";
+  if (!valid.length) return "(no matches)";
+  const shown = valid.slice(0, MAX_GLOB_RESULTS).map(x => x.f).join("\n");
+  return valid.length > MAX_GLOB_RESULTS ? `${shown}\n… +${valid.length - MAX_GLOB_RESULTS} more (newest ${MAX_GLOB_RESULTS} shown)` : shown;
 }
 
 async function listDir(ctx: ToolContext, input: any): Promise<string> {
@@ -710,7 +831,7 @@ export async function executeTool(
         const todos: { text: string; status: string }[] =
           typeof input.todos === "string"
             ? parseTodoString(input.todos)
-            : ((input.todos as any[]) ?? []);
+            : normalizeTodoArray(input.todos);
         ctx.onTodos(todos);
         return { output: "Todos updated.", isError: false };
       }

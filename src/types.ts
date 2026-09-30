@@ -12,7 +12,7 @@ export type TranscriptEvent =
   | { kind: "user";         text: string;                           id: string }
   | { kind: "assistant";    text: string;                           id: string }
   | { kind: "tool_call";    name: string; input: Record<string, unknown>; id: string }
-  | { kind: "tool_result";  name: string; output: string; isError: boolean; id: string }
+  | { kind: "tool_result";  name: string; output: string; isError: boolean; logPath?: string; id: string }
   | { kind: "system";       text: string;                           id: string }
   | { kind: "banner";       config: AgentConfig;                    id: string }
   | { kind: "todos";        todos: Todo[];                          id: string }
@@ -47,6 +47,8 @@ export interface McpServer {
   name:     string;
   url:      string;
   addedAt:  string;
+  /** Extra HTTP headers (e.g. Authorization) sent with every request to this server. */
+  headers?: Record<string, string>;
 }
 
 export interface SavedSession {

@@ -58,11 +58,12 @@ export const SLASH_COMMANDS: SlashCommandSpec[] = [
   },
   { name: "history",    usage: "/history [query]",                             description: "fuzzy-search persistent input history" },
   {
-    name: "mcp",        usage: "/mcp <add|remove|list> [args]",               description: "manage MCP server connections",
+    name: "mcp",        usage: "/mcp <add|remove|list|tools> [args]",               description: "manage MCP server connections",
     subOptions: [
-      { name: "add",    description: "connect a new MCP server", args: "<name> <url>" },
+      { name: "add",    description: "connect an MCP server (http)", args: "<name> <url> [--bearer <token>]" },
       { name: "remove", description: "disconnect an MCP server", args: "<name|url>" },
-      { name: "list",   description: "show all configured MCP servers" },
+      { name: "list",   description: "show servers + live connection status" },
+      { name: "tools",  description: "list the tools MCP servers expose", args: "[name]" },
     ],
   },
   {

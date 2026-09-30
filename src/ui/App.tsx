@@ -27,7 +27,7 @@ import {
   BUILTIN_MODEL_MAP,
 } from "../core/config.js";
 import { SLASH_COMMANDS } from "../core/slashCommands.js";
-import { eventToLines } from "./lines.js";
+import { eventToLines, isToggleable } from "./lines.js";
 import {
   mouseEvents, highlightLine, stripAnsi, sliceCols, plainWidth, wordRangeAt, copyToSystemClipboard,
   type MouseEv,
@@ -35,7 +35,7 @@ import {
 import { handleTelegramCommand, maybeAutoStartTelegram, isBridgeRunning } from "../core/telegramBridge.js";
 import { handlePluginCommand } from "../core/pluginMarket.js";
 import { saveSession, loadSession, listSessions } from "../core/session.js";
-import { clearMcpCache } from "../core/mcpManager.js";
+import { clearMcpCache, probeMcpServer, loadAllMcpCapabilities, buildMcpToolSet } from "../core/mcpManager.js";
 import { handleAgentCommand } from "../core/agentManager.js";
 import wrapAnsi from "wrap-ansi";
 
@@ -84,7 +84,9 @@ export default function App({ config }: { config: AgentConfig }) {
   const [mode, setMode] = useState<Mode>({ kind: "idle" });
   const [inputHeight, setInputHeight] = useState(3);
   const [scrollOffset, setScrollOffset] = useState(0);
-  const lineCacheRef = useRef(new Map<string, { width: number; lines: string[] }>());
+  const lineCacheRef = useRef(new Map<string, { width: number; expanded: boolean; lines: string[] }>());
+  // Tool calls / truncated outputs the user has clicked open (everything else is collapsed)
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
   const [permMode, setPermMode] = useState<PermissionMode>(config.mode);
   const [toolPerms, setToolPerms] = useState(() => getToolPermissions());
   const [tokenUsage, setTokenUsage] = useState<TokenUsage>({ inputTokens: 0, outputTokens: 0, totalTokens: 0 });
@@ -311,6 +313,8 @@ export default function App({ config }: { config: AgentConfig }) {
               "↑ / ↓, wheel       scroll the transcript one line\n" +
               "PageUp / PageDown  scroll the transcript one page\n" +
               "Home / End         jump to the oldest / latest message\n" +
+              "Click ⏺ tool call  show its full arguments (click again → one line)\n" +
+              "Click ▸ output     expand truncated tool output (click again → collapse)\n" +
               "Ctrl+↑ / Ctrl+↓    recall previous prompts (when input is empty)",
           });
           break;
@@ -318,6 +322,7 @@ export default function App({ config }: { config: AgentConfig }) {
         // ── clear ───────────────────────────────────────────────────────────
         case "clear":
           setEvents([]);
+          setExpandedIds(new Set());
           setTodos([]);
           agentRef.current?.reset();
           break;
@@ -623,15 +628,51 @@ export default function App({ config }: { config: AgentConfig }) {
         // ── mcp ───────────────────────────────────────────────────────────────
         case "mcp": {
           const [sub, ...mcpArgs] = rest;
+          const sys = (text: string) => emit({ kind: "system", id: randomUUID(), text });
+          const MCP_USAGE =
+            "Usage:\n" +
+            "  /mcp add <name> <url> [--bearer <token>] [--header Name:Value]\n" +
+            "  /mcp list            connection status of every server\n" +
+            "  /mcp tools [name]    tools each server exposes\n" +
+            "  /mcp remove <name|url>";
           switch (sub) {
             case "add": {
-              const [mcpName, mcpUrl] = mcpArgs;
-              if (!mcpName || !mcpUrl) {
-                emit({ kind: "system", id: randomUUID(), text: "Usage: /mcp add <name> <url>" });
+              const [mcpName, mcpUrl, ...opts] = mcpArgs;
+              if (!mcpName || !mcpUrl) { sys(MCP_USAGE); break; }
+              if (!/^https?:\/\//i.test(mcpUrl)) {
+                sys(`✗ "${mcpUrl}" is not an http(s) URL. Only HTTP MCP servers are supported (Streamable HTTP, e.g. https://host/mcp) — stdio servers and the legacy /sse transport are not.`);
+                break;
+              }
+              const headers: Record<string, string> = {};
+              let badOpt = "";
+              for (let i = 0; i < opts.length; i++) {
+                if (opts[i] === "--bearer" && opts[i + 1]) headers["Authorization"] = `Bearer ${opts[++i]}`;
+                else if (opts[i] === "--header" && opts[i + 1]) {
+                  const h = opts[++i], k = h.indexOf(":");
+                  if (k < 1) { badOpt = h; break; }
+                  headers[h.slice(0, k).trim()] = h.slice(k + 1).trim();
+                } else { badOpt = opts[i]; break; }
+              }
+              if (badOpt) { sys(`✗ Unrecognised option "${badOpt}".\n${MCP_USAGE}`); break; }
+
+              const countBefore = getMcpServers().length;
+              const entry = addMcpServer(mcpName, mcpUrl, headers);
+              if (getMcpServers().length === countBefore) {
+                sys(`MCP server "${entry.name}" (${entry.url}) already matches that name or URL. Run /mcp remove ${entry.name} first to change it.`);
+                break;
+              }
+              clearMcpCache();
+              sys(`⏳ Connecting to "${mcpName}"…`);
+              const caps = await probeMcpServer(entry);
+              if (caps.error) {
+                sys(`⚠ "${mcpName}" was saved but could not be reached: ${caps.error}`);
               } else {
-                addMcpServer(mcpName, mcpUrl);
-                clearMcpCache();
-                emit({ kind: "system", id: randomUUID(), text: `🔌 MCP server "${mcpName}" added (${mcpUrl}).` });
+                const names = caps.tools.map((t) => t.name);
+                sys(
+                  `🔌 "${mcpName}" connected via ${caps.transport} — ${names.length} tool${names.length === 1 ? "" : "s"}` +
+                  (names.length ? `: ${names.slice(0, 8).join(", ")}${names.length > 8 ? ", …" : ""}` : "") +
+                  `\nThe model sees them as mcp__${mcpName}__<tool>. Send your next message to use them.`
+                );
               }
               break;
             }
@@ -639,24 +680,43 @@ export default function App({ config }: { config: AgentConfig }) {
               const nameOrUrl = mcpArgs.join(" ");
               if (removeMcpServer(nameOrUrl)) {
                 clearMcpCache();
-                emit({ kind: "system", id: randomUUID(), text: `MCP server "${nameOrUrl}" removed.` });
+                sys(`MCP server "${nameOrUrl}" removed.`);
               } else {
-                emit({ kind: "system", id: randomUUID(), text: `No MCP server matching "${nameOrUrl}".` });
+                sys(`No MCP server matching "${nameOrUrl}".`);
               }
               break;
             }
             case "list": {
               const servers = getMcpServers();
-              if (!servers.length) {
-                emit({ kind: "system", id: randomUUID(), text: "No MCP servers configured. Use /mcp add <name> <url>." });
-              } else {
-                const lines = servers.map((s) => `  ${s.name.padEnd(20)} ${s.url}`).join("\n");
-                emit({ kind: "system", id: randomUUID(), text: `MCP servers:\n${lines}` });
+              if (!servers.length) { sys("No MCP servers configured. Use /mcp add <name> <url>."); break; }
+              sys("⏳ Checking MCP servers…");
+              const caps = await Promise.all(servers.map(probeMcpServer));
+              const lines = caps.map((c) =>
+                `  ${c.error ? "✗" : "✓"} ${c.server.name.padEnd(16)} ${c.server.url}\n` +
+                `      ${c.error ? c.error : `${c.tools.length} tool${c.tools.length === 1 ? "" : "s"} · ${c.transport}`}` +
+                (c.server.headers ? " · auth header set" : "")
+              ).join("\n");
+              sys(`MCP servers:\n${lines}`);
+              break;
+            }
+            case "tools": {
+              const filter = mcpArgs[0];
+              const all = (await loadAllMcpCapabilities()).filter((c) => !filter || c.server.name === filter);
+              if (!all.length) { sys(filter ? `No MCP server named "${filter}".` : "No MCP servers configured."); break; }
+              const set = buildMcpToolSet(all);
+              const out: string[] = [];
+              for (const c of all) {
+                out.push(`${c.server.name}${c.error ? `  ✗ ${c.error}` : ""}`);
+                for (const t of set.schemas) {
+                  if (set.routes.get(t.name)?.server === c.server)
+                    out.push(`  • ${t.name} — ${t.description.replace(/^\[MCP: [^\]]*\] /, "").split("\n")[0].slice(0, 100)}`);
+                }
               }
+              sys(out.join("\n"));
               break;
             }
             default:
-              emit({ kind: "system", id: randomUUID(), text: "Usage: /mcp add <name> <url> | /mcp remove <name> | /mcp list" });
+              sys(MCP_USAGE);
           }
           break;
         }
@@ -815,23 +875,32 @@ export default function App({ config }: { config: AgentConfig }) {
     todos.length === 0 ? 0 : 1 /*marginTop*/ + 1 /*header*/ + shownTodos.length + (hiddenTodos > 0 ? 1 : 0);
   const reservedRows = modePanelHeight + todoPanelHeight + inputMarginTop + inputHeight + footerHeight;
 
-  const allLines = useMemo(() => {
+  const { allLines, lineOwners } = useMemo(() => {
     const cache = lineCacheRef.current;
     const seen = new Set<string>();
     const out: string[] = [];
+    // owners[i] = id of the toggleable event that row i belongs to (else null)
+    const owners: (string | null)[] = [];
     for (const event of events) {
       seen.add(event.id);
+      const isExp = expandedIds.has(event.id);
       const cached = cache.get(event.id);
       const lines =
-        cached && cached.width === columns ? cached.lines : eventToLines(event, columns);
-      cache.set(event.id, { width: columns, lines });
-      out.push(...lines);
+        cached && cached.width === columns && cached.expanded === isExp
+          ? cached.lines
+          : eventToLines(event, columns, isExp);
+      cache.set(event.id, { width: columns, expanded: isExp, lines });
+      const toggleable = isToggleable(event);
+      for (const l of lines) {
+        out.push(l);
+        owners.push(toggleable && l !== "" ? event.id : null); // blank spacer rows aren't clickable
+      }
     }
     for (const id of cache.keys()) {
       if (!seen.has(id)) cache.delete(id);
     }
-    return out;
-  }, [events, columns]);
+    return { allLines: out, lineOwners: owners };
+  }, [events, columns, expandedIds]);
 
   const scrolled = scrollOffset > 0;
   const viewportRows = Math.max(3, rows - reservedRows - (scrolled ? 1 : 0));
@@ -853,8 +922,36 @@ export default function App({ config }: { config: AgentConfig }) {
   const draggingRef = useRef(false);
   const lastClickRef = useRef<{ t: number; line: number; col: number; count: number } | null>(null);
   // Latest layout numbers for the (mount-once) mouse handler below
-  const layoutRef = useRef({ startIdx: 0, visibleCount: 0, viewportRows: 3, scrolled: false, maxScroll: 0, allLines: [] as string[] });
-  layoutRef.current = { startIdx, visibleCount: visibleLines.length, viewportRows, scrolled, maxScroll, allLines };
+  const layoutRef = useRef({ startIdx: 0, visibleCount: 0, viewportRows: 3, scrolled: false, maxScroll: 0, allLines: [] as string[], owners: [] as (string | null)[] });
+  layoutRef.current = { startIdx, visibleCount: visibleLines.length, viewportRows, scrolled, maxScroll, allLines, owners: lineOwners };
+
+  // ── Click-to-expand for tool calls / truncated tool output ─────────
+  const eventsRef = useRef(events);
+  eventsRef.current = events;
+  const expandedRef = useRef(expandedIds);
+  expandedRef.current = expandedIds;
+  const columnsRef = useRef(columns);
+  columnsRef.current = columns;
+  const toggleRef = useRef<(id: string) => void>(() => {});
+  toggleRef.current = (id: string) => {
+    const ev = eventsRef.current.find((e) => e.id === id);
+    if (!ev) return;
+    const was = expandedRef.current.has(id);
+    const delta =
+      eventToLines(ev, columnsRef.current, !was).length - eventToLines(ev, columnsRef.current, was).length;
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (was) next.delete(id); else next.add(id);
+      return next;
+    });
+    // Keep the clicked row where it is on screen: the rows added/removed sit
+    // below it, so shift the from-bottom scroll offset by the same amount
+    // (bounded by the new max scroll so the wheel doesn't feel "stuck").
+    if (delta !== 0) {
+      const oldMax = layoutRef.current.maxScroll;
+      setScrollOffset((o) => Math.max(0, Math.min(o + delta, oldMax + delta)));
+    }
+  };
 
   // Last known pointer position while dragging, and a hook the layout effect
   // below uses to re-aim the selection end after an auto-scroll step.
@@ -968,7 +1065,12 @@ export default function App({ config }: { config: AgentConfig }) {
         const a = anchorRef.current;
         const p = posAt(ev.x, ev.y);
         if (!a || !p) return;
-        if (a.line === p.line && a.col === p.col) { setSel(null); return; } // plain click
+        if (a.line === p.line && a.col === p.col) {                          // plain click
+          setSel(null);
+          const ownerId = layoutRef.current.owners[p.line];                  // on a tool call / truncated output?
+          if (ownerId) toggleRef.current(ownerId);
+          return;
+        }
         finishSelect(a, p);                                                  // select-to-copy
       }
     };

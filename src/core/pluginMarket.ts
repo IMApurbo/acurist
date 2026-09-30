@@ -7,25 +7,31 @@
  *    { "name": "My Marketplace", "plugins": [{ "name": "git", "description": "...",
  *      "version": "1.0.0", "author": "...", "repo": "...", "systemPromptAddition": "..." }] }
  *
- * 2. Claude Code format (GitHub repo with .claude-plugin/marketplace.json):
- *    { "name": "...", "plugins": [{ "name": "git", "description": "...",
- *      "source": { "github": { "repo": "owner/repo-name" } } }] }
- *    → plugin.json fetched from https://raw.githubusercontent.com/{repo}/HEAD/plugin.json
- *    → SKILL.md fetched from https://raw.githubusercontent.com/{repo}/HEAD/skills/{name}/SKILL.md
+ * 2. Claude Code marketplaces (.claude-plugin/marketplace.json). Plugin
+ *    `source` may be:
+ *      - a relative path in the marketplace repo:  "./plugins/foo"  or  "./"
+ *      - { "source": "github", "repo": "owner/name", "ref"?, "path"? }
+ *      - { "source": "url", "url": "https://github.com/owner/name.git" }
+ *    What Acurist loads from a plugin: its skills — SKILL.md files listed in the
+ *    entry's `skills` array, found under <plugin>/skills/*, or at the plugin root.
+ *    Commands / agents / hooks / .mcp.json are NOT executed (installing a plugin
+ *    that only ships those succeeds but contributes nothing, and says so).
  *
- * 3. GitHub shorthand for marketplace registration:
- *    /plugin marketplace add owner/repo
- *    → resolves to https://raw.githubusercontent.com/owner/repo/HEAD/.claude-plugin/marketplace.json
+ * 3. GitHub shorthand:  /plugin marketplace add owner/repo
+ *    -> https://raw.githubusercontent.com/owner/repo/HEAD/.claude-plugin/marketplace.json
+ *
+ * Browsing only downloads the marketplace manifest; a plugin's skills are
+ * fetched on demand by /plugin add and /plugin info.
  *
  * ── Commands ─────────────────────────────────────────────────────────────────
- *   /plugin marketplace add <url|owner/repo>   — register a marketplace
- *   /plugin marketplace remove <name>          — unregister a marketplace
- *   /plugin marketplace list                   — list registered marketplaces
- *   /plugin browse [marketplace-name]          — fetch & display plugins (interactive)
- *   /plugin add <name>                         — install by name (searches all marketplaces)
- *   /plugin remove <name>                      — uninstall
- *   /plugin list                               — list installed
- *   /plugin info <name>                        — show details
+ *   /plugin marketplace add <url|owner/repo>   register a marketplace
+ *   /plugin marketplace remove <name>          unregister a marketplace
+ *   /plugin marketplace list                   list registered marketplaces
+ *   /plugin browse [marketplace-name]          list plugins
+ *   /plugin add <name>[@marketplace]           install
+ *   /plugin remove <name>                      uninstall
+ *   /plugin list                               list installed
+ *   /plugin info <name>[@marketplace]          show details
  */
 
 import fetch from "node-fetch";
@@ -40,56 +46,47 @@ import {
 } from "./config.js";
 import type { Plugin, Marketplace } from "./config.js";
 
-// ── Claude Code format types ──────────────────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────────
 
-interface ClaudeCodePluginEntry {
-  name: string;
-  description?: string;
-  source?: {
-    github?: {
-      repo: string; // "owner/repo-name"
+/** A plugin as listed in a marketplace. `load` fetches the heavy parts on demand. */
+type ListedPlugin = Omit<Plugin, "installedAt" | "marketplaceUrl"> & {
+  load?: () => Promise<Partial<Plugin>>;
+};
+
+type PluginSource =
+  | string
+  | {
+      source?: string;
+      repo?: string;
+      url?: string;
+      ref?: string;
+      path?: string;
+      github?: { repo: string }; // legacy shape this code used to expect
     };
-  };
-}
 
-interface ClaudeCodeMarketplace {
-  name?: string;
-  plugins: ClaudeCodePluginEntry[];
-}
-
-/** plugin.json fetched from each skill's GitHub repo */
-interface ClaudeCodePluginJson {
+interface ClaudeCodeEntry {
   name?: string;
   description?: string;
   version?: string;
-  author?: string;
-  // May include other metadata; systemPromptAddition comes from SKILL.md
+  author?: string | { name?: string };
+  source?: PluginSource;
+  skills?: string[];
+  [k: string]: unknown;
 }
 
-// ── Marketplace JSON format (Acurist native) ──────────────────────────────────
-
-interface AcuristMarketplaceManifest {
-  name?: string;
-  plugins: Omit<Plugin, "installedAt" | "marketplaceUrl">[];
-}
-
-type MarketplaceManifest = AcuristMarketplaceManifest | ClaudeCodeMarketplace;
-
-// ── URL helpers ───────────────────────────────────────────────────────────────
+// ── URL / path helpers ────────────────────────────────────────────────────────
 
 const GITHUB_RAW = "https://raw.githubusercontent.com";
+const MAX_SKILLS_PER_PLUGIN = 25;
+const MAX_PLUGIN_CHARS = 60_000;
 
-/**
- * Resolve an `owner/repo` shorthand or a full URL into a marketplace URL.
- * Supports:
- *   - "owner/repo"  → Claude Code marketplace at .claude-plugin/marketplace.json
- *   - "https://..." → returned as-is
- */
+const slugify = (s: string) => s.trim().toLowerCase().replace(/\s+/g, "-");
+const stripSlashes = (p: string) => p.replace(/^\.?\/+/, "").replace(/\/+$/, "").replace(/^\.$/, "");
+const joinPath = (...parts: string[]) => parts.filter(Boolean).join("/").replace(/\/+/g, "/");
+
+/** Resolve an `owner/repo` shorthand or a full URL into a marketplace URL. */
 function resolveMarketplaceUrl(input: string): string {
-  if (input.startsWith("http://") || input.startsWith("https://")) {
-    return input;
-  }
-  // GitHub owner/repo shorthand
+  if (input.startsWith("http://") || input.startsWith("https://")) return input;
   if (/^[\w.-]+\/[\w.-]+$/.test(input)) {
     return `${GITHUB_RAW}/${input}/HEAD/.claude-plugin/marketplace.json`;
   }
@@ -99,26 +96,53 @@ function resolveMarketplaceUrl(input: string): string {
   );
 }
 
-/**
- * Build the raw GitHub URL for a plugin.json inside a skill repo.
- * repo = "owner/repo-name"
- */
-function pluginJsonUrl(repo: string): string {
-  return `${GITHUB_RAW}/${repo}/HEAD/plugin.json`;
+/** Directory a marketplace manifest lives in (the root that relative sources resolve from). */
+function marketplaceBase(url: string): string {
+  const m = url.match(/^(.*)\/\.claude-plugin\/[^/]+$/);
+  return m ? m[1] : url.replace(/\/[^/]*$/, "");
 }
 
-/**
- * Build the raw GitHub URL for a SKILL.md inside a skill repo.
- * Tries skills/<name>/SKILL.md, the canonical Claude Code layout.
- */
-function skillMdUrl(repo: string, skillName: string): string {
-  return `${GITHUB_RAW}/${repo}/HEAD/skills/${skillName}/SKILL.md`;
+function githubFromBase(base: string): { owner: string; repo: string; ref: string } | null {
+  const m = base.match(/^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)/);
+  return m ? { owner: m[1], repo: m[2], ref: m[3] } : null;
 }
+
+function githubRepoFromUrl(u: string): string | null {
+  const m = u.match(/github\.com[/:]([^/]+)\/([^/.]+?)(?:\.git)?\/?$/);
+  return m ? `${m[1]}/${m[2]}` : null;
+}
+
+/** Where a Claude-Code-style entry's files live: `${base}/${dir}/...` */
+function locate(entry: ClaudeCodeEntry, marketBase: string): { base: string; dir: string } | null {
+  const s = entry.source;
+  if (typeof s === "string") {
+    if (/^https?:\/\//.test(s)) {
+      const repo = githubRepoFromUrl(s);
+      return repo ? { base: `${GITHUB_RAW}/${repo}/HEAD`, dir: "" } : null;
+    }
+    return { base: marketBase, dir: stripSlashes(s) };
+  }
+  if (s && typeof s === "object") {
+    const repo = s.repo ?? s.github?.repo;
+    if ((s.source === "github" || s.github) && repo) {
+      return { base: `${GITHUB_RAW}/${repo}/${s.ref ?? "HEAD"}`, dir: stripSlashes(s.path ?? "") };
+    }
+    if (s.source === "url" && s.url) {
+      const r = githubRepoFromUrl(s.url);
+      if (r) return { base: `${GITHUB_RAW}/${r}/${s.ref ?? "HEAD"}`, dir: stripSlashes(s.path ?? "") };
+    }
+  }
+  return null;
+}
+
+const authorName = (a: unknown): string | undefined =>
+  typeof a === "string" && a.trim() ? a.trim()
+  : a && typeof a === "object" && typeof (a as any).name === "string" ? (a as any).name : undefined;
 
 // ── Fetch helpers ─────────────────────────────────────────────────────────────
 
 async function fetchText(url: string): Promise<string> {
-  const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+  const res = await fetch(url, { signal: AbortSignal.timeout(10_000) as any });
   if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
   return res.text();
 }
@@ -132,145 +156,155 @@ async function fetchJson<T = unknown>(url: string): Promise<T> {
   }
 }
 
-/**
- * Detect whether a manifest uses the Claude Code format.
- * Claude Code manifests have plugins with a `source.github.repo` field
- * instead of the Acurist `systemPromptAddition` field.
- */
-function isClaudeCodeManifest(data: any): data is ClaudeCodeMarketplace {
-  if (!Array.isArray(data?.plugins)) return false;
-  // If at least one plugin has source.github.repo, it's Claude Code format
-  return data.plugins.some(
-    (p: any) => typeof p?.source?.github?.repo === "string"
-  );
+const tryText = (url: string) => fetchText(url).catch(() => null);
+
+/** Sub-directory names of a repo path via the GitHub contents API (null if unavailable/rate-limited). */
+async function listGithubDirs(gh: { owner: string; repo: string; ref: string }, dir: string): Promise<string[] | null> {
+  try {
+    const qs = gh.ref && gh.ref !== "HEAD" ? `?ref=${encodeURIComponent(gh.ref)}` : "";
+    const headers: Record<string, string> = { Accept: "application/vnd.github+json", "User-Agent": "acurist" };
+    if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+    const res = await fetch(`https://api.github.com/repos/${gh.owner}/${gh.repo}/contents/${dir}${qs}`, {
+      headers, signal: AbortSignal.timeout(10_000) as any,
+    });
+    if (!res.ok) return null;
+    const items = (await res.json()) as any[];
+    return Array.isArray(items) ? items.filter((i) => i.type === "dir").map((i) => String(i.name)) : null;
+  } catch {
+    return null;
+  }
+}
+
+// ── SKILL.md handling ─────────────────────────────────────────────────────────
+
+/** Strip YAML frontmatter and give the skill a clear heading for the system prompt. */
+function formatSkill(md: string, fallbackName: string): string {
+  let body = md.replace(/\r\n/g, "\n");
+  let name = fallbackName, desc = "";
+  const fm = body.match(/^---\n([\s\S]*?)\n---\n?/);
+  if (fm) {
+    body = body.slice(fm[0].length);
+    const unq = (v: string) => v.trim().replace(/^["']|["']$/g, "");
+    const n = fm[1].match(/^name:\s*(.+)$/m);
+    const d = fm[1].match(/^description:\s*(.+)$/m);
+    if (n) name = unq(n[1]);
+    if (d && !/^[>|]/.test(d[1].trim())) desc = unq(d[1]);
+  }
+  return `### Skill: ${name}${desc ? `\n_${desc}_` : ""}\n\n${body.trim()}`;
 }
 
 /**
- * Fetch the plugin.json + SKILL.md for a Claude Code skill repo and assemble
- * a full Acurist Plugin object. Returns null if we can't resolve it (non-fatal).
+ * Fetch a Claude Code plugin's plugin.json + skills and return the pieces
+ * Acurist can use. Never throws for "nothing found" — returns empty text.
  */
-async function resolveClaudeCodePlugin(
-  entry: ClaudeCodePluginEntry,
-  marketplaceUrl: string
-): Promise<Plugin | null> {
-  const repo = entry.source?.github?.repo;
-  if (!repo) return null;
+async function loadClaudeCodePlugin(entry: ClaudeCodeEntry, marketBase: string): Promise<Partial<Plugin>> {
+  const loc = locate(entry, marketBase);
+  if (!loc) return { systemPromptAddition: "" };
+  const { base, dir } = loc;
 
-  let pluginMeta: ClaudeCodePluginJson = {};
-  try {
-    pluginMeta = await fetchJson<ClaudeCodePluginJson>(pluginJsonUrl(repo));
-  } catch {
-    // plugin.json is optional; fall back to marketplace entry metadata
+  let meta: any = {};
+  for (const rel of [".claude-plugin/plugin.json", "plugin.json"]) {
+    const t = await tryText(`${base}/${joinPath(dir, rel)}`);
+    if (t) { try { meta = JSON.parse(t); break; } catch { /* try next */ } }
   }
 
-  // Skill name: prefer plugin.json name, then marketplace entry name
-  const skillName = pluginMeta.name ?? entry.name;
-
-  // Resolve author: guard against the field being an object in the raw JSON
-  const rawAuthor = pluginMeta.author;
-  const author =
-    typeof rawAuthor === "string" && rawAuthor.trim()
-      ? rawAuthor.trim()
-      : repo.split("/")[0];
-
-  // Try multiple SKILL.md candidate paths in order:
-  //   1. skills/<skillName>/SKILL.md   (canonical Claude Code layout)
-  //   2. skills/<entry.name>/SKILL.md  (entry name differs from plugin.json name)
-  //   3. SKILL.md                      (root of repo, simpler repos)
-  let systemPromptAddition = "";
-  const skillMdCandidates = [
-    skillMdUrl(repo, skillName),
-    ...(entry.name !== skillName ? [skillMdUrl(repo, entry.name)] : []),
-    `${GITHUB_RAW}/${repo}/HEAD/SKILL.md`,
-  ];
-  for (const url of skillMdCandidates) {
-    try {
-      systemPromptAddition = await fetchText(url);
-      break; // found it
-    } catch {
-      // try next candidate
-    }
+  // Which skill folders/files to load
+  const explicit = Array.isArray(entry.skills) ? entry.skills : Array.isArray(meta.skills) ? meta.skills : null;
+  const name = String(entry.name ?? meta.name ?? "plugin");
+  let skillPaths: string[];
+  if (explicit) {
+    skillPaths = explicit
+      .filter((x: unknown): x is string => typeof x === "string")
+      .map((x: string) => joinPath(dir, stripSlashes(x)));
+  } else {
+    const gh = githubFromBase(base);
+    const names = gh ? await listGithubDirs(gh, joinPath(dir, "skills")) : null;
+    skillPaths = names?.length ? names.map((n) => joinPath(dir, "skills", n)) : [joinPath(dir, "skills", name)];
+    skillPaths.push(dir); // SKILL.md at the plugin root
   }
+  skillPaths = [...new Set(skillPaths)].slice(0, MAX_SKILLS_PER_PLUGIN);
+
+  const fetched = await Promise.all(
+    skillPaths.map(async (p) => {
+      const url = p.endsWith(".md") ? `${base}/${p}` : `${base}/${joinPath(p, "SKILL.md")}`;
+      const md = await tryText(url);
+      return md ? formatSkill(md, p.split("/").pop() || name) : null;
+    }),
+  );
+
+  const parts: string[] = [];
+  let used = 0, omitted = 0;
+  for (const part of fetched) {
+    if (!part) continue;
+    if (used + part.length > MAX_PLUGIN_CHARS) { omitted++; continue; }
+    parts.push(part); used += part.length;
+  }
+  if (omitted) parts.push(`(${omitted} more skill${omitted > 1 ? "s" : ""} omitted — plugin size limit)`);
 
   return {
-    name: skillName.toLowerCase().replace(/\s+/g, "-"),
-    description:
-      pluginMeta.description ?? entry.description ?? "(no description)",
-    version: pluginMeta.version ?? "0.0.0",
-    author,
-    repo: `https://github.com/${repo}`,
-    systemPromptAddition,
-    installedAt: "",
-    marketplaceUrl,
+    systemPromptAddition: parts.join("\n\n---\n\n"),
+    version: typeof meta.version === "string" ? meta.version : undefined,
+    description: typeof meta.description === "string" ? meta.description : undefined,
+    author: authorName(meta.author),
   };
 }
 
 /**
- * Fetch and normalise a marketplace URL into a list of Acurist Plugin objects.
- * Handles both Acurist native format and Claude Code format transparently.
+ * Fetch and normalise a marketplace into a list of plugins. Only the manifest
+ * is downloaded here; `plugin.load()` fetches skills when needed.
  */
-async function fetchMarketplace(
-  url: string
-): Promise<{ name?: string; plugins: Omit<Plugin, "installedAt" | "marketplaceUrl">[] }> {
+async function fetchMarketplace(url: string): Promise<{ name?: string; plugins: ListedPlugin[] }> {
   const data = await fetchJson<any>(url);
 
   // Support bare array (legacy)
   const manifest: any = Array.isArray(data) ? { plugins: data } : data;
-  if (!Array.isArray(manifest.plugins)) {
-    throw new Error(`Invalid marketplace format at ${url}`);
-  }
+  if (!Array.isArray(manifest.plugins)) throw new Error(`Invalid marketplace format at ${url}`);
 
-  // ── Claude Code format ────────────────────────────────────────────────────
-  if (isClaudeCodeManifest(manifest)) {
-    const resolved = await Promise.all(
-      manifest.plugins.map((entry: ClaudeCodePluginEntry) =>
-        resolveClaudeCodePlugin(entry, url).catch(() => null)
-      )
-    );
-    return {
-      name: manifest.name,
-      plugins: resolved.filter((p): p is Plugin => p !== null),
-    };
-  }
+  const base = marketplaceBase(url);
+  const gh = githubFromBase(base);
 
-  // ── Acurist native format ─────────────────────────────────────────────────
-  // Sanitize each plugin entry so downstream code can safely call string methods
-  const sanitized: AcuristMarketplaceManifest = {
-    name: manifest.name,
-    plugins: (manifest as AcuristMarketplaceManifest).plugins.map((p) => ({
-      name:                  (p.name                  ?? "unknown").toLowerCase().replace(/\s+/g, "-"),
-      description:           p.description            ?? "(no description)",
-      version:               p.version                ?? "0.0.0",
-      author:                p.author                 ?? "unknown",
-      repo:                  p.repo                   ?? "",
-      systemPromptAddition:  p.systemPromptAddition   ?? "",
-    })),
-  };
-  return sanitized;
+  const plugins: ListedPlugin[] = manifest.plugins
+    .filter((p: unknown) => p && typeof p === "object")
+    .map((p: ClaudeCodeEntry & { repo?: string; systemPromptAddition?: string }) => {
+      const native = typeof p.systemPromptAddition === "string";
+      const loc = !native && p.source ? locate(p, base) : null;
+      const ghSrc = loc ? githubFromBase(loc.base) : gh;
+      const repo =
+        p.repo ??
+        (ghSrc ? `https://github.com/${ghSrc.owner}/${ghSrc.repo}${loc?.dir ? `/tree/${ghSrc.ref}/${loc.dir}` : ""}` : "");
+      const listed: ListedPlugin = {
+        name: slugify(String(p.name ?? "unknown")),
+        description: p.description ?? "(no description)",
+        version: p.version ?? "0.0.0",
+        author: authorName(p.author) ?? ghSrc?.owner ?? "unknown",
+        repo,
+        systemPromptAddition: native ? (p.systemPromptAddition as string) : "",
+      };
+      if (!native && p.source) listed.load = () => loadClaudeCodePlugin(p, base);
+      return listed;
+    });
+
+  return { name: manifest.name, plugins };
 }
 
-/** Fetch plugins from all registered marketplaces, or just one if name given. */
+/** Fetch plugins from all registered marketplaces (in registration order), or just one if name given. */
 export async function fetchAllPlugins(
   marketplaceName?: string
-): Promise<{ plugin: Plugin; marketplace: Marketplace }[]> {
-  const markets = getMarketplaces().filter(
-    (m) => !marketplaceName || m.name === marketplaceName
-  );
+): Promise<{ plugin: Plugin; marketplace: Marketplace; load?: () => Promise<Partial<Plugin>> }[]> {
+  const markets = getMarketplaces().filter((m) => !marketplaceName || m.name === marketplaceName);
 
-  const results: { plugin: Plugin; marketplace: Marketplace }[] = [];
-
-  await Promise.all(
+  // Fetch in parallel but keep a stable order, so "first match wins" is deterministic.
+  const perMarket = await Promise.all(
     markets.map(async (market) => {
       try {
         const manifest = await fetchMarketplace(market.url);
-        for (const p of manifest.plugins) {
-          results.push({
-            plugin: { ...p, installedAt: "", marketplaceUrl: market.url },
-            marketplace: market,
-          });
-        }
+        return manifest.plugins.map(({ load, ...p }) => ({
+          plugin: { ...p, installedAt: "", marketplaceUrl: market.url } as Plugin,
+          marketplace: market,
+          load,
+        }));
       } catch (e: any) {
-        results.push({
+        return [{
           plugin: {
             name: `[error:${market.name}]`,
             description: `Could not fetch: ${e.message}`,
@@ -279,14 +313,23 @@ export async function fetchAllPlugins(
             systemPromptAddition: "",
             installedAt: "",
             marketplaceUrl: market.url,
-          },
+          } as Plugin,
           marketplace: market,
-        });
+          load: undefined,
+        }];
       }
     })
   );
+  return perMarket.flat();
+}
 
-  return results;
+/** Merge lazily-loaded fields onto a listed plugin, ignoring undefined/empty values. */
+function mergeLoaded(p: Plugin, extra: Partial<Plugin>): Plugin {
+  const out: any = { ...p };
+  for (const [k, v] of Object.entries(extra)) if (v !== undefined && v !== "") out[k] = v;
+  // systemPromptAddition may legitimately be "" (nothing found) — keep it in sync
+  if (extra.systemPromptAddition !== undefined) out.systemPromptAddition = extra.systemPromptAddition;
+  return out as Plugin;
 }
 
 // ── ANSI helpers ──────────────────────────────────────────────────────────────
@@ -326,7 +369,7 @@ export async function handlePluginCommand(args: string[]): Promise<string> {
 
       try {
         const manifest = await fetchMarketplace(url);
-        const entry = addMarketplace(url, manifest.name);
+        const entry = addMarketplace(url, manifest.name ? slugify(manifest.name) : undefined);
         const count = manifest.plugins.length;
         const isGhShorthand = !input.startsWith("http");
         const sourceNote = isGhShorthand
@@ -432,44 +475,65 @@ export async function handlePluginCommand(args: string[]): Promise<string> {
     }
   }
 
-  // ── /plugin add <name> ───────────────────────────────────────────────────────
+  // ── /plugin add <name>[@marketplace] ─────────────────────────────────────
   if (sub === "add") {
-    const name = args[1]?.toLowerCase();
-    if (!name) return "Usage: /plugin add <name>";
+    const spec = args[1]?.toLowerCase();
+    if (!spec) return "Usage: /plugin add <name>[@marketplace]";
+    const [name, wantMarket] = spec.split("@");
 
     if (getPlugin(name)) {
       return `Plugin "${name}" is already installed. Use /plugin remove ${name} first to reinstall.`;
     }
 
-    let found: Plugin | undefined;
+    let matches: Awaited<ReturnType<typeof fetchAllPlugins>> = [];
     try {
       const all = await fetchAllPlugins();
-      const match = all.find((a) => a.plugin.name === name);
-      if (match) found = match.plugin;
+      matches = all.filter(
+        (a) => a.plugin.name === name && (!wantMarket || a.marketplace.name.toLowerCase() === wantMarket)
+      );
     } catch {
       // fall through to "not found"
     }
 
-    if (!found) {
+    if (!matches.length) {
       return (
-        red(`Plugin "${name}" not found in any registered marketplace.\n`) +
+        red(`Plugin "${name}"${wantMarket ? ` in marketplace "${wantMarket}"` : ""} not found.\n`) +
         `Run /plugin browse to see available plugins.\n` +
         `Run /plugin marketplace add <url|owner/repo> to add more marketplaces.`
       );
     }
 
+    const chosen = matches[0];
+    let found = chosen.plugin;
+    if (chosen.load) {
+      try {
+        found = mergeLoaded(found, await chosen.load());
+      } catch (e: any) {
+        return red(`✗ Could not download "${name}": ${e.message}`);
+      }
+    }
+
     installPlugin({ ...found, installedAt: new Date().toISOString() });
 
-    const hasPrompt = found.systemPromptAddition.trim().length > 0;
+    const promptText = (found.systemPromptAddition ?? "").trim();
+    const skillCount = (promptText.match(/^### Skill: /gm) ?? []).length;
+    const others = matches.slice(1).map((m) => m.marketplace.name);
     return (
       green(`✓ Plugin "${name}" installed.\n`) +
       `${found.description}\n` +
       `Version: ${found.version}  Author: ${found.author}\n` +
       (found.repo ? `Repo:    ${found.repo}\n` : "") +
+      (others.length ? dim(`Also in: ${others.join(", ")} — use ${name}@<marketplace> to pick.\n`) : "") +
       `\n` +
-      (hasPrompt
-        ? dim(`Plugin's capabilities are now active in this session.`)
-        : dim(`Note: no SKILL.md found — plugin has no system prompt addition.`))
+      (promptText
+        ? dim(
+            (skillCount ? `Loaded ${skillCount} skill${skillCount > 1 ? "s" : ""} ` : `Loaded instructions `) +
+            `(${promptText.length} chars) — active from your next message.`
+          )
+        : dim(
+            `Note: no SKILL.md found, so this plugin adds nothing to the model. ` +
+            `Acurist only loads skills — Claude Code plugins that ship just commands/agents/hooks aren't supported.`
+          ))
     );
   }
 
@@ -501,35 +565,42 @@ export async function handlePluginCommand(args: string[]): Promise<string> {
     return `Installed plugins (${installed.length}):\n\n${rows.join("\n\n")}`;
   }
 
-  // ── /plugin info <name> ──────────────────────────────────────────────────────
+  // ── /plugin info <name>[@marketplace] ────────────────────────────────────
   if (sub === "info") {
-    const name = args[1]?.toLowerCase();
-    if (!name) return "Usage: /plugin info <name>";
+    const spec = args[1]?.toLowerCase();
+    if (!spec) return "Usage: /plugin info <name>[@marketplace]";
+    const [name, wantMarket] = spec.split("@");
 
     const inst = getPlugin(name);
     let remote: Plugin | undefined;
 
-    try {
-      const all = await fetchAllPlugins();
-      remote = all.find((a) => a.plugin.name === name)?.plugin;
-    } catch {}
+    if (!inst) {
+      try {
+        const all = await fetchAllPlugins();
+        const m = all.find((a) => a.plugin.name === name && (!wantMarket || a.marketplace.name.toLowerCase() === wantMarket));
+        if (m) {
+          remote = m.plugin;
+          if (m.load) { try { remote = mergeLoaded(remote, await m.load()); } catch {} }
+        }
+      } catch {}
+    }
 
     const p = inst ?? remote;
     if (!p) return red(`Plugin "${name}" not found.`);
 
     const promptText    = p.systemPromptAddition ?? "";
-    const promptPreview = promptText.trim().slice(0, 200);
-    const truncated     = promptText.trim().length > 200 ? "…" : "";
+    const promptPreview = promptText.trim().slice(0, 400);
+    const truncated     = promptText.trim().length > 400 ? "…" : "";
 
     return (
       `${bold(p.name)} v${p.version}\n` +
       `${"─".repeat(40)}\n` +
       `${p.description}\n\n` +
       `Author:      ${p.author}\n` +
-      `Repo:        ${p.repo ?? "n/a"}\n` +
+      `Repo:        ${p.repo || "n/a"}\n` +
       `Marketplace: ${p.marketplaceUrl ?? "n/a"}\n` +
       `Installed:   ${inst ? green("yes") + ` (${inst.installedAt?.slice(0, 10)})` : red("no")}\n\n` +
-      `System prompt addition:\n${dim(promptPreview + truncated)}`
+      `System prompt addition (${promptText.trim().length} chars):\n${dim(promptPreview || "(none)")}${truncated}`
     );
   }
 
@@ -537,10 +608,12 @@ export async function handlePluginCommand(args: string[]): Promise<string> {
   return (
     bold("Plugin commands:\n") +
     `  /plugin browse [name]              — browse & install from a marketplace\n` +
-    `  /plugin add <name>                 — install a plugin\n` +
+    `  /plugin add <name>[@marketplace]   — install a plugin
+` +
     `  /plugin remove <name>              — uninstall a plugin\n` +
     `  /plugin list                       — list installed plugins\n` +
-    `  /plugin info <name>                — show plugin details\n` +
+    `  /plugin info <name>[@marketplace]  — show plugin details
+` +
     `  /plugin marketplace list           — list registered marketplaces\n` +
     `  /plugin marketplace add <url|owner/repo>  — add a marketplace\n` +
     `  /plugin marketplace remove <name>  — remove a marketplace\n\n` +
@@ -550,9 +623,15 @@ export async function handlePluginCommand(args: string[]): Promise<string> {
 
 /** Build the combined system prompt addition from all installed plugins. */
 export function buildPluginSystemPrompt(): string {
-  const plugins = getPlugins();
-  if (plugins.length === 0) return "";
-  return "\n\n" + plugins.map((p) => p.systemPromptAddition.trim()).join("\n\n");
+  const active = getPlugins().filter((p) => (p.systemPromptAddition ?? "").trim().length > 0);
+  if (active.length === 0) return "";
+  return (
+    "\n\n## Installed plugins\n\n" +
+    "The user installed the plugins below. Follow their instructions when the task matches.\n\n" +
+    active
+      .map((p) => `## Plugin: ${p.name}${p.version ? ` (v${p.version})` : ""}\n\n${p.systemPromptAddition.trim()}`)
+      .join("\n\n")
+  );
 }
 
 /**
@@ -563,6 +642,6 @@ export function buildPluginSystemPrompt(): string {
  */
 export function getActivePluginNames(): string[] {
   return getPlugins()
-    .filter((p) => p.systemPromptAddition.trim().length > 0)
+    .filter((p) => (p.systemPromptAddition ?? "").trim().length > 0)
     .map((p) => p.name);
 }

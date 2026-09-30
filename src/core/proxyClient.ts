@@ -82,7 +82,7 @@ export class ProxyClient {
         const result = await this._askOnce(messages, system, signal, tools);
         return result;
       } catch (e: any) {
-        if (e?.name === "AbortError") throw e;
+        if (e?.name === "AbortError" || e?.noRetry) throw e;
         lastError = e;
         process.stderr?.write?.(`[proxyClient] Attempt ${attempt} failed: ${e?.message}\n`);
       }
@@ -125,7 +125,10 @@ export class ProxyClient {
 
     if (!res.ok) {
       const errBody = await res.text().catch(() => "");
-      throw new Error(`Proxy ${res.status} ${res.statusText}\n${errBody}`);
+      const err: any = new Error(`Proxy ${res.status} ${res.statusText}\n${errBody}`);
+      // 4xx (except timeout / rate-limit) is deterministic — retrying just burns 60s
+      if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) err.noRetry = true;
+      throw err;
     }
 
     const data = await res.json() as any;
@@ -146,7 +149,10 @@ export class ProxyClient {
         // — but we no longer do that silently.
         if (toolName === undefined) {
           toolName  = block.name;
-          toolInput = block.input ?? {};
+          let inp: unknown = block.input ?? {};
+          // Some OpenAI-compat proxies return tool arguments as a JSON string
+          if (typeof inp === "string") { try { inp = JSON.parse(inp); } catch { inp = {}; } }
+          toolInput = (inp && typeof inp === "object" ? inp : {}) as Record<string, unknown>;
         }
       }
     }
@@ -174,11 +180,13 @@ export class ProxyClient {
       // stop reason so callers (agent.ts) can decide whether it's safe to
       // execute a write_file/edit_file call with possibly-incomplete input.
       if (toolName === "write_file" && typeof toolInput?.content !== "string") {
-        throw new Error(
+        const err: any = new Error(
           "Response truncated (max_tokens) while generating a write_file call, " +
           "and the file content could not be parsed at all. Aborting this tool call " +
           "rather than writing a corrupt/empty file."
         );
+        err.noRetry = true; // same prompt would truncate the same way
+        throw err;
       }
     }
 

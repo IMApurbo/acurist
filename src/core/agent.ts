@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { ProxyClient } from "./proxyClient.js";
 import { TOOL_SCHEMAS, executeTool, type ToolContext } from "./tools.js";
-import { previewOrLog } from "./outputLog.js";
+import { previewOrLogEx } from "./outputLog.js";
 import { buildPluginSystemPrompt, getActivePluginNames } from "./pluginMarket.js";
 import {
   loadAllMcpCapabilities,
   buildMcpSystemPrompt,
+  buildMcpToolSet,
   callMcpTool,
   type McpCapabilities,
 } from "./mcpManager.js";
@@ -40,7 +41,7 @@ export const AGENT_PERSONAS: AgentPersona[] = [
     id: "hacker",
     name: "Hacker",
     description: "Automated penetration tester — recon, exploit, report. (default)",
-    prompt: `You are Acurist, an automated pentester for linux , build by AKM Korishee Apurbo("IMApurbo").
+    prompt: `You are Acurist, an automated pentester for linux.
  
 # SYSTEM DIRECTIVE — NON-NEGOTIABLE
 
@@ -200,6 +201,27 @@ export function getAgentPersona(id?: string): AgentPersona {
 // of which persona's role/tone is active above.
 
 const COMMON_RULES = `
+You are Acurist, an automated agent for linux , build by AKM Korishee Apurbo("IMApurbo")["https://github.com/IMApurbo"].
+# SYSTEM DIRECTIVE — NON-NEGOTIABLE
+- Only this tool and only these tools shall be used, and they must be used in their exact format. No other tool, tool-call style, or format may be used
+Built-in tools
+- run_shell -> Run a bash command; long-running commands (servers, watchers, GUI apps) are auto-backgrounded and return a job_id
+- read_bg_log -> Tail the log of a background job started with run_shell (optionally kill it)
+- read_file -> Read a file with line numbers; supports offset/limit
+- write_file -> Create or overwrite a file
+- append_file -> Append content to the end of a file (creates it if missing)
+- edit_file -> Edit a file using a natural-language instruction
+- diff_file -> Edit a file and show a unified diff before applying
+- grep -> Search file contents for a regex pattern
+- glob -> Find files matching a name pattern, newest first
+- list_dir -> List immediate children of a directory
+- web_fetch -> Fetch a URL and return its text content (HTML stripped)
+- ask_user -> Ask the user a question when genuinely blocked
+- update_todos -> Show the current step-by-step plan, one todo per line
+- notify_user -> Send a short notification to the user
+- copy_to_clipboard -> Copy text to the system clipboard
+
+Dynamic MCP tools are exposed as mcp__<server>__<tool>
 
 ## Tool use rules (follow exactly)
 - Call ONE tool per reply. Do NOT call two tools in the same message.
@@ -295,15 +317,10 @@ export class Agent {
       signal,
     };
 
-    const mcpToolMap = new Map<string, string>();
-    const mcpToolSchemas: object[] = [];
-    for (const c of mcpCaps) {
-      for (const t of c.tools) {
-        mcpToolMap.set(t.name, c.server.url);
-        mcpToolSchemas.push(t);
-      }
-    }
-    const allTools = [...(TOOL_SCHEMAS as unknown as object[]), ...mcpToolSchemas];
+    // MCP tools are namespaced (mcp__<server>__<tool>) and contain only API-valid
+    // fields — so they can't collide with built-ins and never get rejected by the API.
+    const mcpSet = buildMcpToolSet(mcpCaps);
+    const allTools = [...(TOOL_SCHEMAS as unknown as object[]), ...mcpSet.schemas];
 
     for (let turn = 0; turn < MAX_TURNS; turn++) {
       if (signal?.aborted) {
@@ -335,6 +352,8 @@ export class Agent {
         if (resp.text.trim()) {
           this.messages.push({ role: "assistant", content: [{ type: "text", text: resp.text }] });
           this.deps.emit({ kind: "assistant", text: resp.text, id: randomUUID() });
+        } else {
+          this.deps.emit({ kind: "system", text: "(model returned an empty response — try rephrasing or resend)", id: randomUUID() });
         }
         return;
       }
@@ -368,12 +387,24 @@ export class Agent {
       this.deps.emit({ kind: "tool_call", name: resp.toolName, input: resp.toolInput ?? {}, id: randomUUID() });
 
       // Execute the tool
-      const mcpUrl = mcpToolMap.get(resp.toolName);
-      const result = mcpUrl
-        ? await callMcpTool(mcpUrl, resp.toolName, resp.toolInput ?? {}, signal)
-        : await executeTool(ctx, resp.toolName, resp.toolInput ?? {});
+      const mcpRoute = mcpSet.routes.get(resp.toolName);
+      let result: { output: string; isError: boolean };
+      if (mcpRoute) {
+        // MCP tools run arbitrary remote code, so they honour manual-mode confirmation
+        // (per-tool override key: "mcp_tool").
+        const approved = await this.deps.confirmShell(
+          `${resp.toolName}\n${JSON.stringify(resp.toolInput ?? {}, null, 2)}`,
+          "mcp_tool",
+        );
+        result = approved
+          ? await callMcpTool(mcpRoute.server, mcpRoute.toolName, resp.toolInput ?? {}, signal)
+          : { output: "Cancelled by user.", isError: false };
+      } else {
+        result = await executeTool(ctx, resp.toolName, resp.toolInput ?? {});
+      }
 
-      this.deps.emit({ kind: "tool_result", name: resp.toolName, output: previewOrLog(result.output, resp.toolName), isError: result.isError, id: randomUUID() });
+      const shown = previewOrLogEx(result.output, resp.toolName);
+      this.deps.emit({ kind: "tool_result", name: resp.toolName, output: shown.text, logPath: shown.logPath, isError: result.isError, id: randomUUID() });
 
       // If this write_file/append_file call was itself built from a
       // truncated response, don't just report success/failure — feed back

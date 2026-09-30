@@ -162,11 +162,11 @@ export function removeMarketplace(nameOrUrl: string) {
 // ── MCP Servers ───────────────────────────────────────────────────────────────
 
 export function getMcpServers()                      { return store.get("mcpServers") ?? []; }
-export function addMcpServer(name: string, url: string) {
+export function addMcpServer(name: string, url: string, headers?: Record<string, string>) {
   const list = getMcpServers();
   const existing = list.find(s => s.name === name || s.url === url);
   if (existing) return existing;
-  const entry: McpServer = { name, url, addedAt: new Date().toISOString() };
+  const entry: McpServer = { name, url, addedAt: new Date().toISOString(), ...(headers && Object.keys(headers).length ? { headers } : {}) };
   store.set("mcpServers", [...list, entry]);
   return entry;
 }
