@@ -43,23 +43,6 @@ Connect Acurist to any local or remote OpenAI/Anthropic-compatible endpoint (Oll
 
 ![acurist in action](./docs/screenshot.png)
 
-## Feature Comparison
-
-| Feature / Capability | Acurist | Claude Code | Cursor | GitHub Copilot |
-| :--- | :---: | :---: | :---: | :---: |
-| **Autonomous Security Command Execution** | ✅ | ✅ | ❌ | ❌ |
-| **Automatic Backgrounding (Listeners / Servers)** | ✅ | ❌ | ❌ | ❌ |
-| **Fully Offline / Air-Gapped Operation** | ✅ | ❌ | ❌ | ❌ |
-| **Vendor Agnostic (Ollama / Local Proxies)** | ✅ | ❌ | ❌ | ❌ |
-| **Model Context Protocol (MCP) Integration** | ✅ | ✅ | ❌ | ❌ |
-| **Remote Bridge (Telegram C2 Integration)** | ✅ | ❌ | ❌ | ❌ |
-| **Custom Agent Personas** | ✅ | ❌ | ❌ | ❌ |
-| **Plugin Marketplace** | ✅ | ❌ | ❌ | ❌ |
-| **Session State Persistence** | ✅ | ❌ | ❌ | ❌ |
-| **Open Source** | ✅ | ❌ | ❌ | ❌ |
-
----
-
 ## System Requirements
 
 - **Node.js**: `v22.0.0` or higher
