@@ -433,33 +433,78 @@ function closeUnbalancedJson(s: string): string | null {
   return s + stack.reverse().join('');
 }
 
-// All valid parameter names across all tools — used to avoid misreading command content as a new key
-const KNOWN_PARAMS = new Set([
-  // run_shell
-  "command", "timeout_seconds", "background", "settle_seconds",
-  // read_bg_log
-  "job_id", "tail_lines", "kill",
-  // read_file
-  "path", "offset", "limit",
-  // write_file / append_file
-  "content",
-  // edit_file / diff_file
-  "instruction",
-  // grep
-  "pattern", "glob",
-  // web_fetch
-  "url",
-  // ask_user
-  "question", "options",
-  // update_todos
-  "todos",
-  // notify_user
-  "message",
-  // copy_to_clipboard
-  "text",
-  // list_dir
-  "show_hidden",
-]);
+// Valid parameter names PER TOOL — used to avoid misreading command/content
+// text as a new key. This used to be one flat set shared by every tool,
+// which meant a write_file containing a line like "path: ./foo" (a YAML
+// snippet, a log line, a docstring — anything) would get misread as the
+// start of a brand-new parameter and silently chop the file in half. Scoping
+// the set per tool means a key only ends a value if it's actually a
+// parameter *of that tool*.
+const TOOL_PARAMS: Record<string, Set<string>> = {
+  run_shell:          new Set(["command", "timeout_seconds", "background", "settle_seconds"]),
+  read_bg_log:        new Set(["job_id", "tail_lines", "kill"]),
+  read_file:          new Set(["path", "offset", "limit"]),
+  write_file:         new Set(["path", "content"]),
+  append_file:        new Set(["path", "content"]),
+  edit_file:          new Set(["path", "instruction"]),
+  diff_file:          new Set(["path", "instruction"]),
+  grep:               new Set(["pattern", "path", "glob"]),
+  glob:               new Set(["pattern", "path"]),
+  list_dir:           new Set(["path", "show_hidden"]),
+  web_fetch:          new Set(["url", "timeout_seconds"]),
+  ask_user:           new Set(["question", "options"]),
+  update_todos:       new Set(["todos"]),
+  notify_user:        new Set(["message"]),
+  copy_to_clipboard:  new Set(["text"]),
+};
+
+// The one "body" parameter per tool — free-form text that legitimately
+// contains blank lines, colons, code, etc. Once we see this key, the rest of
+// the call (up to the next TOOL: header) belongs to it; we stop trying to
+// split it on lines that merely *look* like "key: value".
+const GREEDY_PARAM: Record<string, string> = {
+  run_shell:          "command",
+  write_file:         "content",
+  append_file:        "content",
+  edit_file:          "instruction",
+  diff_file:          "instruction",
+  update_todos:       "todos",
+  notify_user:        "message",
+  copy_to_clipboard:  "text",
+};
+
+// run_shell lists "command" first, with optional scalar flags after it. If
+// the model does emit those after a multi-line command, recover them from
+// the tail of the greedily-captured command instead of losing them.
+const TRAILING_SCALAR_PARAMS: Record<string, RegExp> = {
+  run_shell: /^(timeout_seconds|background|settle_seconds):\s*(\S+)\s*$/,
+};
+
+// Some tool-calling formats (Claude's own <invoke>/<parameter> XML, Llama's
+// <function=...><parameter=...>, DeepSeek's <｜tool▁call▁begin｜> family, etc.)
+// occasionally leak into a model's plain-text output as a stray wrapper
+// around the whole value, e.g.:
+//   command: <parameter=command>
+//   ls -la
+//   </parameter>
+// That wrapper then gets executed/written verbatim, breaking bash syntax or
+// corrupting file content. Strip it ONLY when it wraps the entire value
+// (open tag as the first line, matching close tag as the last line) so real
+// content that merely mentions these tags in passing is left untouched.
+function unwrapStrayToolTags(value: string): string {
+  let v = value;
+  const openRe = /^<[\/]?(parameter|function|invoke|tool_call)(?:[^>\n]*)>[ \t]*\n/i;
+  const closeRe = /\n[ \t]*<\/(parameter|function|invoke|tool_call)>[ \t]*$/i;
+  for (let i = 0; i < 3; i++) {
+    const om = v.match(openRe);
+    const cm = v.match(closeRe);
+    if (!om || !cm) break;
+    const openName = om[0].match(/(parameter|function|invoke|tool_call)/i)![1].toLowerCase();
+    if (openName !== cm[1].toLowerCase()) break;
+    v = v.slice(om[0].length, v.length - cm[0].length);
+  }
+  return v;
+}
 
 // Parse plain-text tool calls of the form:
 //   TOOL: tool_name
@@ -469,27 +514,53 @@ function parseToolCalls(text: string): Array<{ name: string; input: Record<strin
   const results = [];
   const toolPat = /^(?:TOOL|OL):\s*([\w-]+)\s*$/gm;
 
+  // Find every recognized tool header up front so each call's body can be
+  // bounded by the start of the NEXT header rather than guessed from blank
+  // lines alone — this also stops one call's (mis-)parsed content from
+  // swallowing a second, genuinely separate TOOL: block that follows it.
+  const headers: { name: string; headerStart: number; bodyStart: number }[] = [];
   for (const tm of text.matchAll(toolPat)) {
     const toolName = tm[1].trim();
     if (!ACURIST_TOOL_NAMES.has(toolName)) continue;
+    headers.push({ name: toolName, headerStart: tm.index!, bodyStart: tm.index! + tm[0].length + 1 });
+  }
 
-    const start = tm.index!;
+  for (let hi = 0; hi < headers.length; hi++) {
+    const { name: toolName, headerStart, bodyStart } = headers[hi];
+    const boundary = hi + 1 < headers.length ? headers[hi + 1].headerStart : text.length;
+
+    const allowedParams = TOOL_PARAMS[toolName] ?? new Set<string>();
+    const greedyParam = GREEDY_PARAM[toolName] ?? null;
+
+    const body = text.slice(bodyStart, boundary);
+    const lines = body.split("\n");
     const input: Record<string, string> = {};
-
-    const afterTool = tm.index! + tm[0].length + 1; // +1 for the newline
-    const rest = text.slice(afterTool);
-    const lines = rest.split("\n");
-    let end = afterTool;
+    let end = bodyStart;
     let currentKey: string | null = null;
     let currentVal: string[] = [];
 
-    const flush = () => { if (currentKey) input[currentKey] = currentVal.join("\n").trimEnd(); };
+    const flush = () => { if (currentKey) input[currentKey] = unwrapStrayToolTags(currentVal.join("\n").trimEnd()); };
 
     let consecutiveBlanks = 0;
     for (const line of lines) {
-      // Only treat as a new key if the word before the colon is a known param name
+      if (currentKey && currentKey === greedyParam) {
+        // Inside the tool's free-form body param: never treat a line as a
+        // new key just because it happens to look like "word: value", and
+        // never cut it short on blank lines either — real code can contain
+        // any number of blank lines (module docstrings, PEP8 spacing,
+        // generated files with extra whitespace, etc). The ONLY thing that
+        // ends this field is reaching `boundary`, i.e. the next real
+        // TOOL: header or the end of the message — which is already how far
+        // `lines` extends, so we just keep consuming every line here.
+        currentVal.push(line);
+        end += line.length + 1;
+        continue;
+      }
+
+      // Only treat as a new key if the word before the colon is a parameter
+      // this specific tool actually has.
       const kMatch = line.match(/^([\w-]+):\s*/);
-      if (kMatch && KNOWN_PARAMS.has(kMatch[1])) {
+      if (kMatch && allowedParams.has(kMatch[1])) {
         consecutiveBlanks = 0;
         flush();
         currentKey = kMatch[1];
@@ -522,7 +593,26 @@ function parseToolCalls(text: string): Array<{ name: string; input: Record<strin
       }
     }
     flush();
-    results.push({ name: toolName, input, start, end });
+
+    // Recover trailing scalar flags that got swallowed into a greedy body
+    // param, e.g. run_shell's "background: true" appended after the command.
+    const trailingRe = greedyParam ? TRAILING_SCALAR_PARAMS[toolName] : undefined;
+    if (trailingRe && input[greedyParam!]) {
+      const bodyLines = input[greedyParam!].split("\n");
+      const recovered: Record<string, string> = {};
+      while (bodyLines.length > 1) {
+        const m = bodyLines[bodyLines.length - 1].match(trailingRe);
+        if (!m) break;
+        recovered[m[1]] = m[2];
+        bodyLines.pop();
+      }
+      if (Object.keys(recovered).length) {
+        input[greedyParam!] = bodyLines.join("\n").trimEnd();
+        for (const [k, v] of Object.entries(recovered)) input[k] = v;
+      }
+    }
+
+    results.push({ name: toolName, input, start: headerStart, end: Math.min(end, boundary) });
   }
   return results;
 }
