@@ -62,12 +62,12 @@ export const TOOL_SCHEMAS = [
   },
   {
     name: "write_file",
-    description: "Create or overwrite a file. Use edit_file to change only part of a file.",
+    description: "Create a new file, or completely REPLACE an existing one. `content` is written to disk verbatim as the ENTIRE file, so it must be the full final file text — never a diff, a snippet, or a placeholder like '... rest unchanged ...'. To change only part of an existing file use edit_file. Parent directories are created automatically. For a very large file, write the first part here and add the rest with append_file.",
     input_schema: {
       type: "object",
       properties: {
-        path:    { type: "string" },
-        content: { type: "string" },
+        path:    { type: "string", description: "File to create or overwrite. Absolute path preferred; a relative path resolves against the working directory. An existing file at this path is replaced entirely." },
+        content: { type: "string", description: "The COMPLETE file content, exactly as it should appear on disk: raw text only — no markdown code fences, no commentary, no line numbers. Must be the last parameter; write nothing after it." },
       },
       required: ["path", "content"],
     },
@@ -78,32 +78,32 @@ export const TOOL_SCHEMAS = [
     input_schema: {
       type: "object",
       properties: {
-        path:    { type: "string" },
-        content: { type: "string", description: "Only the NEW content to add at the end of the file. Do not repeat existing content." },
+        path:    { type: "string", description: "File to append to. Same path that was used with write_file." },
+        content: { type: "string", description: "Only the NEW content to add at the end of the file, as raw text (no markdown code fences, no commentary). Do not repeat existing content. Must be the last parameter; write nothing after it." },
       },
       required: ["path", "content"],
     },
   },
   {
     name: "edit_file",
-    description: "Edit a file using a natural-language instruction. Prefer over write_file for partial changes.",
+    description: "Edit an EXISTING file from a natural-language instruction. A separate model rewrites the whole file and the result replaces the original, so the instruction must be precise and self-contained. Prefer this over write_file for partial changes. The file must already exist (use write_file to create one); read_file it first so you can name exact functions or lines.",
     input_schema: {
       type: "object",
       properties: {
-        path:        { type: "string", description: "File to edit." },
-        instruction: { type: "string", description: "Precise description of the change." },
+        path:        { type: "string", description: "Path of the EXISTING file to edit." },
+        instruction: { type: "string", description: "Self-contained description of the change. The editing model sees only the file and this text, not the conversation: name the function/section/line and state exactly what to add, remove or replace, quoting the literal new text when it is short. Everything not mentioned is left unchanged." },
       },
       required: ["path", "instruction"],
     },
   },
   {
     name: "diff_file",
-    description: "Edit a file and show a unified diff before applying. In manual mode the user approves first.",
+    description: "Same as edit_file (EXISTING file, natural-language instruction, whole file rewritten by a separate model) but the unified diff is shown first and returned in the result. In manual mode the user approves the diff before it is applied.",
     input_schema: {
       type: "object",
       properties: {
-        path:        { type: "string" },
-        instruction: { type: "string" },
+        path:        { type: "string", description: "Path of the EXISTING file to edit." },
+        instruction: { type: "string", description: "Self-contained description of the change. The editing model sees only the file and this text, not the conversation: name the function/section/line and state exactly what to add, remove or replace, quoting the literal new text when it is short. Everything not mentioned is left unchanged." },
       },
       required: ["path", "instruction"],
     },
@@ -218,7 +218,12 @@ export interface ToolContext {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function abs(cwd: string, p: string) { return path.isAbsolute(p) ? p : path.resolve(cwd, p); }
+function abs(cwd: string, p: string) {
+  // Expand a leading "~" — models often send "~/x" and path.resolve would
+  // otherwise create a literal "~" directory inside cwd.
+  if (p === "~" || p.startsWith("~/")) p = path.join(os.homedir(), p.slice(1));
+  return path.isAbsolute(p) ? p : path.resolve(cwd, p);
+}
 
 async function walk(dir: string, out: string[], depth = 0): Promise<void> {
   if (depth > 12) return;
@@ -360,20 +365,93 @@ async function askFullText(
   return { text: acc, truncated: true };
 }
 
+// ── Whole-file rewrite plumbing (edit_file / diff_file) ───────────────────────
+
+const FILE_BEGIN = "<<<ACURIST_FILE_BEGIN>>>";
+const FILE_END   = "<<<ACURIST_FILE_END>>>";
+
+const REWRITE_SYSTEM =
+  "You are a precise code-editing engine. Reply with the complete resulting file placed between the two marker lines you are given, and nothing else.";
+
+function buildRewritePrompt(displayPath: string, instruction: string, original: string): string {
+  return (
+    `Apply the instruction below to the file and reply with the COMPLETE new file content: every line of the file, ` +
+    `changed or unchanged — never a diff, a snippet, or a placeholder such as "rest of file unchanged". ` +
+    `Do not add any commentary and do not wrap the content in markdown code fences. Use exactly this layout:\n` +
+    `${FILE_BEGIN}\n<the full new file content>\n${FILE_END}\n` +
+    `Anything outside the two marker lines is discarded.\n\n` +
+    `Instruction: ${instruction}\n\n` +
+    `--- FILE (${displayPath}) ---\n${original}\n--- END OF FILE ---`
+  );
+}
+
+const FENCE_LINE = /^[ \t]*```/;
+const PROSE_LEAD =
+  /^(?:sure|certainly|of course|okay|ok|here(?:'s| is| are)|below is|i(?:'ve| have|'ll| will)|the (?:updated|modified|complete|full|new|edited) (?:file|version|content|code)|this (?:updated|modified|new) )/i;
+const PROSE_TAIL = /^(?:let me know|i hope (?:this|that)|hope this helps|feel free to|this (?:change|edit|update) )/i;
+const PLACEHOLDER_RE =
+  /^[ \t]*(?:\/\/|#|\/\*|<!--|--|;)?[ \t]*(?:\.{3}|…)[ \t]*(?:rest|remaining|existing|unchanged|previous|same|other)\b[^\n]*$|(?:rest|remainder) of (?:the )?(?:file|code|content|function|class)[^\n]*(?:unchanged|same|omitted|here)/im;
+
+const firstLine = (t: string) => t.split(/\r?\n/).find(l => l.trim() !== "") ?? "";
+const lastLine  = (t: string) => [...t.split(/\r?\n/)].reverse().find(l => l.trim() !== "") ?? "";
+
 /**
- * Turn raw model output into the new file content WITHOUT damaging it.
- * - Only unwraps a fence when the WHOLE reply is one fenced block (never trims
- *   the file's own leading indentation / blank lines).
- * - Skips unwrapping if the original file itself starts with a fence (e.g. .md).
- * - Restores the original's line endings (CRLF) and trailing newline, which
- *   models routinely drop.
+ * Pull the new file body out of the model's reply WITHOUT damaging it.
+ *
+ * 1. Preferred: the body between FILE_BEGIN / FILE_END. Everything outside the
+ *    markers (preambles, "hope this helps", stray fences) is discarded. A BEGIN
+ *    with no END means the reply was cut off or malformed — refuse rather than
+ *    write a partial file.
+ * 2. Fallback (model ignored the markers): unwrap a single fenced block even if
+ *    prose surrounds it, but only when the original has no fences of its own
+ *    (e.g. a .md file) and there is exactly one fenced block. Anything
+ *    ambiguous is rejected instead of being written to disk.
  */
-function cleanModelFile(text: string, original: string): string {
-  let out = text;
-  if (!/^\s*```/.test(original)) {
-    const m = out.match(/^\s*```[a-zA-Z0-9_+-]*[ \t]*\r?\n([\s\S]*?)\r?\n?```\s*$/);
-    if (m) out = m[1];
+function extractModelFile(text: string, original: string, kind: string, full: string): string {
+  const b = text.indexOf(FILE_BEGIN);
+  if (b !== -1) {
+    let body = text.slice(b + FILE_BEGIN.length).replace(/^[ \t]*\r?\n/, "");
+    const e = body.lastIndexOf(FILE_END);
+    if (e === -1) {
+      throw new Error(
+        `${kind} for ${full}: the model's reply has no closing ${FILE_END} marker, so it was probably cut off. ` +
+        `Refusing to overwrite the file with possibly-incomplete content. Retry with a smaller, more targeted instruction.`
+      );
+    }
+    body = body.slice(0, e).replace(/\r?\n$/, "");
+    return body;
   }
+
+  let out = text.replace(/^\s*--- FILE \([^\n]*\) ---\r?\n/, "");
+  const lines = out.split(/\r?\n/);
+  const fenceIdx = lines.flatMap((l, i) => (FENCE_LINE.test(l) ? [i] : []));
+  const origHasFence = original.split(/\r?\n/).some(l => FENCE_LINE.test(l));
+
+  if (!origHasFence && fenceIdx.length > 0) {
+    if (fenceIdx.length !== 2) {
+      throw new Error(
+        `${kind} for ${full}: the model's reply contains ${fenceIdx.length} markdown fence lines mixed with the content, ` +
+        `so the file body can't be identified safely. Refusing to write. Retry with a more specific instruction.`
+      );
+    }
+    return lines.slice(fenceIdx[0] + 1, fenceIdx[1]).join("\n");
+  }
+
+  const fl = firstLine(out), ll = lastLine(out);
+  if ((PROSE_LEAD.test(fl.trim()) && !PROSE_LEAD.test(firstLine(original).trim())) ||
+      (PROSE_TAIL.test(ll.trim()) && !PROSE_TAIL.test(lastLine(original).trim()))) {
+    throw new Error(
+      `${kind} for ${full}: the model's reply looks like it contains explanatory prose around the file ` +
+      `("${(PROSE_LEAD.test(fl.trim()) ? fl : ll).trim().slice(0, 60)}…"). Refusing to write prose into the file. ` +
+      `Retry with a more specific instruction.`
+    );
+  }
+  return out;
+}
+
+/** Restore the original's line endings and trailing newline, which models routinely drop. */
+function normalizeFileEnds(text: string, original: string): string {
+  let out = text;
   const origCRLF = original.includes("\r\n");
   if (origCRLF && !out.includes("\r\n")) out = out.replace(/\n/g, "\r\n");
   const eol = origCRLF ? "\r\n" : "\n";
@@ -383,9 +461,18 @@ function cleanModelFile(text: string, original: string): string {
   return out;
 }
 
-/** Refuse rewrites that look like the model answered with prose instead of a file. */
+/** Refuse rewrites that look like the model answered with prose, a snippet, or a placeholder instead of the file. */
 function assertPlausibleRewrite(kind: string, full: string, original: string, next: string) {
   if (!next.trim()) throw new Error(`Model returned no content for ${kind}`);
+  if (next.includes(FILE_BEGIN) || next.includes(FILE_END)) {
+    throw new Error(`${kind} for ${full}: stray ${FILE_BEGIN}/${FILE_END} marker left in the model's output. Refusing to write. Retry.`);
+  }
+  if (PLACEHOLDER_RE.test(next) && !PLACEHOLDER_RE.test(original)) {
+    throw new Error(
+      `${kind} for ${full}: the model used a placeholder (e.g. "... rest unchanged ...") instead of writing the full file. ` +
+      `Refusing to overwrite. Retry with a smaller, more targeted instruction.`
+    );
+  }
   if (original.length > 200 && next.length < original.length * 0.3) {
     throw new Error(
       `${kind} for ${full} would shrink the file from ${original.length} to ${next.length} chars ` +
@@ -393,6 +480,44 @@ function assertPlausibleRewrite(kind: string, full: string, original: string, ne
       `Refusing to overwrite. Retry with a more specific instruction or use write_file.`
     );
   }
+}
+
+/**
+ * Shared front half of edit_file / diff_file: validate input, read the file,
+ * have the model rewrite it, and return a cleaned + validated result.
+ */
+async function rewriteViaModel(
+  ctx: ToolContext, kind: "edit_file" | "diff_file", input: any,
+): Promise<{ full: string; original: string; next: string; mtimeMs: number }> {
+  if (typeof input.path !== "string" || !input.path) throw new Error(`${kind} requires a non-empty string path`);
+  if (typeof input.instruction !== "string" || !input.instruction.trim()) {
+    throw new Error(`${kind} requires a non-empty string instruction describing exactly what to change`);
+  }
+  const full = abs(ctx.cwd, input.path);
+  let st: import("node:fs").Stats;
+  try { st = await fs.stat(full); }
+  catch (e: any) {
+    if (e?.code === "ENOENT") throw new Error(`${full} does not exist — ${kind} only edits existing files; use write_file to create it`);
+    throw e;
+  }
+  if (st.isDirectory()) throw new Error(`${full} is a directory — ${kind} needs a file path`);
+  const buf = await fs.readFile(full);
+  if (buf.subarray(0, 8192).includes(0)) throw new Error(`${full} looks like a binary file (${buf.length} bytes) — ${kind} only edits text files`);
+  const original = buf.toString("utf-8");
+
+  const { text, truncated } = await askFullText(
+    ctx, buildRewritePrompt(input.path, input.instruction, original), REWRITE_SYSTEM,
+  );
+  if (truncated) {
+    throw new Error(
+      `${kind} for ${full} was still truncated after multiple continuation attempts. ` +
+      `Refusing to overwrite the existing file with an incomplete result. ` +
+      `Try a smaller, more targeted instruction or split the edit into steps.`
+    );
+  }
+  const next = normalizeFileEnds(extractModelFile(text, original, kind, full), original);
+  assertPlausibleRewrite(kind, full, original, next);
+  return { full, original, next, mtimeMs: st.mtimeMs };
 }
 
 async function assertUnchangedOnDisk(full: string, mtimeMs: number, kind: string) {
@@ -406,33 +531,64 @@ async function confirmWrite(ctx: ToolContext, tool: string, detail: string): Pro
   return ctx.confirmShell(detail, tool);
 }
 
+/** Extensions where a file legitimately starts/ends with a ``` fence. */
+const FENCE_OK_EXT = new Set([".md", ".markdown", ".mdx", ".rst", ".txt", ".adoc"]);
+
+/** A whole-file body wrapped in a markdown fence is a model formatting slip for any non-doc file type. */
+function assertNoFenceWrapper(tool: string, full: string, content: string) {
+  if (FENCE_OK_EXT.has(path.extname(full).toLowerCase())) return;
+  if (/^\s*```[\w+-]*[ \t]*\r?\n/.test(content)) {
+    throw new Error(
+      `${tool}: content for ${full} starts with a markdown code fence (\`\`\`). \`content\` is written to disk verbatim, ` +
+      `so send the raw file text only — no fences, no commentary. Nothing was written; call ${tool} again with the raw content.`
+    );
+  }
+}
+
 async function writeFile(ctx: ToolContext, input: any): Promise<string> {
+  if (typeof input.path !== "string" || !input.path) throw new Error("write_file requires a non-empty string path");
   if (typeof input.content !== "string") {
     throw new Error(
       `write_file received non-string content (got ${typeof input.content}). ` +
-      `This usually means the model's tool call was truncated or malformed — refusing to write.`
+      `This usually means the tool call was cut off or malformed — nothing was written. ` +
+      `Retry with a SHORTER first chunk via write_file, then add the remaining parts with append_file.`
     );
   }
-  if (typeof input.path !== "string" || !input.path) throw new Error("write_file requires a non-empty string path");
   const full = abs(ctx.cwd, input.path);
-  if (!(await confirmWrite(ctx, "write_file", `write_file ${full} (${input.content.split("\n").length} lines)`))) return "Cancelled by user.";
+  assertNoFenceWrapper("write_file", full, input.content);
+
+  let existing: string | null = null;
+  try {
+    const st = await fs.stat(full);
+    if (st.isDirectory()) throw new Error(`${full} is a directory — write_file needs a file path`);
+    existing = st.size <= 5_000_000 ? await fs.readFile(full, "utf-8") : "";
+  } catch (e: any) {
+    if (e?.code !== "ENOENT") throw e;
+  }
+  const newLines = input.content.split("\n").length;
+  const detail = existing === null
+    ? `write_file ${full} (new file, ${newLines} lines)`
+    : `write_file ${full} (OVERWRITING existing file: ${existing.split("\n").length} → ${newLines} lines)`;
+  if (!(await confirmWrite(ctx, "write_file", detail))) return "Cancelled by user.";
   await fs.mkdir(path.dirname(full), { recursive: true });
   await fs.writeFile(full, input.content, "utf-8");
-  return `Wrote ${Buffer.byteLength(input.content)} bytes to ${full}`;
+  return `${existing === null ? "Created" : "Overwrote"} ${full} — ${Buffer.byteLength(input.content)} bytes, ${newLines} lines`;
 }
 
 /** Append content to an existing file (or create it). Used to continue a
  * write_file that got cut off by max_tokens without regenerating the whole
  * file from scratch. */
 async function appendFile(ctx: ToolContext, input: any): Promise<string> {
+  if (typeof input.path !== "string" || !input.path) throw new Error("append_file requires a non-empty string path");
   if (typeof input.content !== "string") {
     throw new Error(
       `append_file received non-string content (got ${typeof input.content}). ` +
-      `The continuation call may itself have been truncated or malformed — refusing to append.`
+      `The continuation call may itself have been truncated or malformed — nothing was appended. ` +
+      `Retry with a smaller chunk.`
     );
   }
-  if (typeof input.path !== "string" || !input.path) throw new Error("append_file requires a non-empty string path");
   const full = abs(ctx.cwd, input.path);
+  assertNoFenceWrapper("append_file", full, input.content);
   if (!(await confirmWrite(ctx, "append_file", `append_file ${full} (+${input.content.split("\n").length} lines)`))) return "Cancelled by user.";
   await fs.mkdir(path.dirname(full), { recursive: true });
   await fs.appendFile(full, input.content, "utf-8");
@@ -441,31 +597,12 @@ async function appendFile(ctx: ToolContext, input: any): Promise<string> {
 }
 
 async function editFile(ctx: ToolContext, input: any): Promise<string> {
-  if (typeof input.path !== "string" || !input.path) throw new Error("edit_file requires a non-empty string path");
-  const full     = abs(ctx.cwd, input.path);
-  const { mtimeMs } = await fs.stat(full);
-  const original = await fs.readFile(full, "utf-8");
-  const prompt   =
-    `Apply this instruction and return ONLY the complete new file content — no commentary, no fences.\n\nInstruction: ${input.instruction}\n\n--- FILE (${input.path}) ---\n${original}`;
-
-  const { text, truncated } = await askFullText(
-    ctx, prompt,
-    "You are a precise code-editing engine. Output only the full resulting file.",
-  );
-  if (truncated) {
-    throw new Error(
-      `edit_file for ${full} was still truncated after multiple continuation attempts. ` +
-      `Refusing to overwrite the existing file with an incomplete result. ` +
-      `Try a smaller, more targeted instruction or split the edit into steps.`
-    );
-  }
-  const cleaned = cleanModelFile(text, original);
-  assertPlausibleRewrite("edit_file", full, original, cleaned);
-  if (cleaned === original) return `No changes made to ${full} (model returned identical content).`;
-  if (!(await confirmWrite(ctx, "edit_file", unifiedDiff(original, cleaned, input.path)))) return "Edit rejected.";
+  const { full, original, next, mtimeMs } = await rewriteViaModel(ctx, "edit_file", input);
+  if (next === original) return `No changes made to ${full} (model returned identical content).`;
+  if (!(await confirmWrite(ctx, "edit_file", unifiedDiff(original, next, input.path)))) return "Edit rejected.";
   await assertUnchangedOnDisk(full, mtimeMs, "edit_file");
-  await fs.writeFile(full, cleaned, "utf-8");
-  return `Edited ${full} (${Buffer.byteLength(cleaned)} bytes)`;
+  await fs.writeFile(full, next, "utf-8");
+  return `Edited ${full} (${Buffer.byteLength(next)} bytes)`;
 }
 
 function unifiedDiff(oldText: string, newText: string, filePath: string): string {
@@ -539,34 +676,15 @@ function unifiedDiff(oldText: string, newText: string, filePath: string): string
 }
 
 async function diffFile(ctx: ToolContext, input: any): Promise<string> {
-  if (typeof input.path !== "string" || !input.path) throw new Error("diff_file requires a non-empty string path");
-  const full     = abs(ctx.cwd, input.path);
-  const { mtimeMs } = await fs.stat(full);
-  const original = await fs.readFile(full, "utf-8");
-  const prompt   =
-    `Apply this instruction and return ONLY the complete new file content — no commentary, no fences.\n\nInstruction: ${input.instruction}\n\n--- FILE (${input.path}) ---\n${original}`;
-
-  const { text, truncated } = await askFullText(
-    ctx, prompt,
-    "You are a precise code-editing engine. Output only the full resulting file.",
-  );
-  if (truncated) {
-    throw new Error(
-      `diff_file for ${full} was still truncated after multiple continuation attempts. ` +
-      `Refusing to produce a diff against an incomplete result. ` +
-      `Try a smaller, more targeted instruction or split the edit into steps.`
-    );
-  }
-  const newContent = cleanModelFile(text, original);
-  assertPlausibleRewrite("diff_file", full, original, newContent);
-  if (newContent === original) return `No changes: model returned identical content for ${full}.`;
-  const diff = unifiedDiff(original, newContent, input.path);
+  const { full, original, next, mtimeMs } = await rewriteViaModel(ctx, "diff_file", input);
+  if (next === original) return `No changes: model returned identical content for ${full}.`;
+  const diff = unifiedDiff(original, next, input.path);
 
   // confirmShell resolves per-tool override → global mode (auto/manual) itself.
   // (Previously this defaulted to "auto" here, so manual mode never prompted.)
   if (await ctx.confirmShell(diff, "diff_file")) {
     await assertUnchangedOnDisk(full, mtimeMs, "diff_file");
-    await fs.writeFile(full, newContent, "utf-8");
+    await fs.writeFile(full, next, "utf-8");
     return `Applied diff to ${full}\n${diff}`;
   }
   return `Diff rejected.\n${diff}`;

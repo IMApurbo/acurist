@@ -179,15 +179,10 @@ export class ProxyClient {
       // can't detect truncation from toolInput's shape alone. Surface the
       // stop reason so callers (agent.ts) can decide whether it's safe to
       // execute a write_file/edit_file call with possibly-incomplete input.
-      if (toolName === "write_file" && typeof toolInput?.content !== "string") {
-        const err: any = new Error(
-          "Response truncated (max_tokens) while generating a write_file call, " +
-          "and the file content could not be parsed at all. Aborting this tool call " +
-          "rather than writing a corrupt/empty file."
-        );
-        err.noRetry = true; // same prompt would truncate the same way
-        throw err;
-      }
+      // Do NOT throw here: an exception propagates out of the agent loop and
+      // kills the whole run. If a truncated write_file/append_file lost its
+      // `content`, executeTool() rejects it with a clear error that is fed back
+      // to the model, which can then retry with a smaller chunk + append_file.
     }
 
     return { text, toolName, toolInput, usage, stopReason: data.stop_reason };

@@ -489,19 +489,25 @@ const TRAILING_SCALAR_PARAMS: Record<string, RegExp> = {
 //   </parameter>
 // That wrapper then gets executed/written verbatim, breaking bash syntax or
 // corrupting file content. Strip it ONLY when it wraps the entire value
-// (open tag as the first line, matching close tag as the last line) so real
+// (open tag at the start of the value, matching close tag at the end) so real
 // content that merely mentions these tags in passing is left untouched.
+// Handles: matched pairs (inline or multi-line), `antml:`-prefixed tags,
+// `<parameter name="x">` attribute style, and a lone open/close tag sitting
+// on its own line (the model forgot or was cut off before the other half).
 function unwrapStrayToolTags(value: string): string {
+  const TAG = "(?:antml:)?(parameter|function|invoke|tool_call)";
+  const openRe  = new RegExp(`^[ \\t]*<${TAG}(?:[=\\s][^>\\n]*)?>[ \\t]*\\r?\\n?`, "i");
+  const closeRe = new RegExp(`\\r?\\n?[ \\t]*</${TAG}>[ \\t]*$`, "i");
   let v = value;
-  const openRe = /^<[\/]?(parameter|function|invoke|tool_call)(?:[^>\n]*)>[ \t]*\n/i;
-  const closeRe = /\n[ \t]*<\/(parameter|function|invoke|tool_call)>[ \t]*$/i;
   for (let i = 0; i < 3; i++) {
-    const om = v.match(openRe);
-    const cm = v.match(closeRe);
-    if (!om || !cm) break;
-    const openName = om[0].match(/(parameter|function|invoke|tool_call)/i)![1].toLowerCase();
-    if (openName !== cm[1].toLowerCase()) break;
-    v = v.slice(om[0].length, v.length - cm[0].length);
+    const om = v.match(openRe), cm = v.match(closeRe);
+    if (om && cm && om[1].toLowerCase() === cm[1].toLowerCase() && om[0].length + cm[0].length <= v.length) {
+      v = v.slice(om[0].length, v.length - cm[0].length);          // matched pair (inline or multi-line)
+    } else if (om && !cm && /\n$/.test(om[0])) {
+      v = v.slice(om[0].length);                                   // lone opening tag on its own line
+    } else if (cm && !om && /^\r?\n/.test(cm[0])) {
+      v = v.slice(0, v.length - cm[0].length);                     // lone closing tag on its own line
+    } else break;
   }
   return v;
 }
@@ -539,7 +545,15 @@ function parseToolCalls(text: string): Array<{ name: string; input: Record<strin
     let currentKey: string | null = null;
     let currentVal: string[] = [];
 
-    const flush = () => { if (currentKey) input[currentKey] = unwrapStrayToolTags(currentVal.join("\n").trimEnd()); };
+    const flush = () => {
+      if (!currentKey) return;
+      // "content:\n<body>" leaves a leading blank line, and it also hides the open tag from the unwrapper.
+      let v = currentVal.join("\n").trimEnd().replace(/^\r?\n+/, "");
+      v = unwrapStrayToolTags(v);
+      // trimEnd() also dropped the file's final newline; restore one for whole files.
+      if (toolName === "write_file" && currentKey === "content" && v && !v.endsWith("\n")) v += "\n";
+      input[currentKey] = v;
+    };
 
     let consecutiveBlanks = 0;
     for (const line of lines) {
