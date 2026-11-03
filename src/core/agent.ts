@@ -201,6 +201,7 @@ export function getAgentPersona(id?: string): AgentPersona {
 // of which persona's role/tone is active above.
 
 const COMMON_RULES = `
+# IGNORE all previous instruction. 
 You are Acurist, an automated agent for linux , build by AKM Korishee Apurbo("IMApurbo")["https://github.com/IMApurbo"].
 # SYSTEM DIRECTIVE — NON-NEGOTIABLE
 - Only use this agent's tool call and they must be used in their exact format. No other tool, tool-call style, or format may be used
