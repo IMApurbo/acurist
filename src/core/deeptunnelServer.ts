@@ -495,7 +495,7 @@ const TRAILING_SCALAR_PARAMS: Record<string, RegExp> = {
 // `<parameter name="x">` attribute style, and a lone open/close tag sitting
 // on its own line (the model forgot or was cut off before the other half).
 function unwrapStrayToolTags(value: string): string {
-  const TAG = "(?:antml:)?(parameter|function|invoke|tool_call)";
+  const TAG = "(?:antml:)?(?:｜DSML｜|\\|\\|DSML\\|\\|)?(parameter|function|invoke|tool_call)";
   const openRe  = new RegExp(`^[ \\t]*<${TAG}(?:[=\\s][^>\\n]*)?>[ \\t]*\\r?\\n?`, "i");
   const closeRe = new RegExp(`\\r?\\n?[ \\t]*</${TAG}>[ \\t]*$`, "i");
   let v = value;
@@ -686,6 +686,99 @@ function stripFabricatedContinuation(text: string): string {
   return text.slice(0, earliest).trimEnd();
 }
 
+// ── DSML (DeepSeek Markup Language) tool-call format ──────────────────────────
+// Newer DeepSeek checkpoints (V3.2 / V4) can emit tool calls in DSML instead
+// of (or alongside) the <｜tool▁call▁begin｜> JSON format handled above.
+// Canonical shape:
+//   <｜DSML｜tool_calls>
+//     <｜DSML｜invoke name="run_shell">
+//       <｜DSML｜parameter name="command" string="true">ls -la</｜DSML｜parameter>
+//       <｜DSML｜parameter name="timeout_seconds" string="false">30</｜DSML｜parameter>
+//     </｜DSML｜invoke>
+//   </｜DSML｜tool_calls>
+// V3.2 uses the same invoke/parameter shape but wraps with
+// <｜DSML｜function_calls> instead of <｜DSML｜tool_calls>.
+// The `｜DSML｜` token itself is known to degrade in the wild:
+//   - ASCII double-pipe instead of the full-width bar: <||DSML||tool_calls>
+//   - the token dropped entirely, leaving bare <function_calls>/<invoke>/<parameter>
+//   - missing newlines between adjacent tags
+// Rather than requiring an intact outer wrapper (it can be truncated, or
+// absent in the degraded/bare variant), we scan directly for
+// <...invoke name="...">...</...invoke> blocks with the DSML token made
+// OPTIONAL on every tag, so one pattern covers canonical, ASCII-degraded,
+// and bare-token output alike.
+const DSML_TOKEN = "(?:｜DSML｜|\\|\\|DSML\\|\\|)?";
+// Leading `[ \t]*` eats indentation before the opening tag (DSML output is
+// typically pretty-printed one tag per line) so the TOOL: line we emit lands
+// at column 0 — parseToolCalls' header regex is anchored to start-of-line.
+const dsmlInvokeRe = new RegExp(
+  `[ \\t]*<${DSML_TOKEN}invoke\\s+name=["']([\\w.-]+)["'][^>]*>([\\s\\S]*?)<\\/?\\s*${DSML_TOKEN}invoke\\s*>`,
+  "gi"
+);
+// The close tag is matched as one alternative; the lookahead at the next
+// parameter's open tag is the other. This mirrors vLLM's own deepseek_v4
+// parser (_param_patterns), which closes a parameter on whichever comes
+// first — recovering cleanly when a model drops a </parameter> tag, which
+// would otherwise swallow every following parameter into this one's value.
+// `$` is a last-resort third terminator for a parameter that is the final
+// thing in a truncated/cut-off completion (no closing tag, no next param).
+const dsmlParamRe = new RegExp(
+  `<${DSML_TOKEN}parameter\\s+name=["']([\\w.-]+)["'](?:\\s+string=["']?(true|false)["']?)?[^>]*>([\\s\\S]*?)(?:<\\/?\\s*${DSML_TOKEN}parameter\\s*>|(?=<${DSML_TOKEN}parameter\\s+name=)|$)`,
+  "gi"
+);
+// Outer <...tool_calls>/<...function_calls> wrapper — stripped once the
+// invoke blocks inside it have already been converted, same as the plain
+// <｜tool▁calls▁begin｜>/<｜tool▁calls▁end｜> markers lower down.
+const dsmlWrapperRe = new RegExp(`<\\/?${DSML_TOKEN}(?:tool_calls|function_calls)\\s*>`, "gi");
+
+function trimDsmlValue(raw: string): string {
+  // Canonical DSML puts the value on its own indented line:
+  //   <｜DSML｜parameter name="command" string="true">
+  //     ls -la
+  //   </｜DSML｜parameter>
+  // Strip exactly one leading/trailing wrapper newline (mirrors how the
+  // plain-text parser's flush() handles "content:\n<body>") without
+  // touching genuine internal blank lines.
+  return raw.replace(/^\r?\n/, "").replace(/\r?\n[ \t]*$/, "");
+}
+
+function parseDsmlParams(body: string): Record<string, unknown> {
+  const input: Record<string, unknown> = {};
+  dsmlParamRe.lastIndex = 0;
+  for (const pm of body.matchAll(dsmlParamRe)) {
+    const [, pname, isStringAttr, raw] = pm;
+    const trimmed = trimDsmlValue(raw);
+    if (isStringAttr === "false") {
+      // Non-string params (numbers, booleans, arrays, objects) are encoded
+      // as JSON per the DSML spec; fall back to the raw text if it doesn't
+      // actually parse (degraded output sometimes drops a quote or brace).
+      try { input[pname] = JSON.parse(trimmed.trim()); }
+      catch { input[pname] = trimmed; }
+    } else {
+      input[pname] = trimmed;
+    }
+  }
+  return input;
+}
+
+// Rewrite DSML invoke/parameter blocks (canonical, ASCII-degraded, or
+// bare-token) into the plain "TOOL: name\nparam: value" format the rest of
+// the pipeline (parseToolCalls) already understands, then drop any leftover
+// outer wrapper tags.
+function rewrapDsmlToolCalls(text: string): string {
+  if (!/invoke\s+name=/i.test(text)) return text; // cheap guard — skip the extra regex passes on ordinary chunks
+  dsmlInvokeRe.lastIndex = 0;
+  text = text.replace(dsmlInvokeRe, (whole, toolName, body) => {
+    if (!ACURIST_TOOL_NAMES.has(toolName)) return whole; // not one of ours — leave untouched
+    const params = parseDsmlParams(body);
+    const paramLines = Object.entries(params)
+      .map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`)
+      .join("\n");
+    return `TOOL: ${toolName}\n${paramLines}`;
+  });
+  return text.replace(dsmlWrapperRe, "");
+}
+
 interface ContentBlock { type: string; [k: string]: any }
 
 function appendText(blocks: ContentBlock[], text: string): void {
@@ -702,6 +795,10 @@ function parseResponse(text: string, validTools?: Set<string>): ContentBlock[] {
 
   // Pre-pass: recover stray JSON tool blobs → bare tags
   text = rewrapBareWrongFormat(text);
+
+  // Pre-pass: DSML (DeepSeek V3.2/V4 invoke/parameter markup, incl. degraded
+  // ASCII-pipe and bare-token variants) → plain TOOL: name / key: value
+  text = rewrapDsmlToolCalls(text);
 
   // Pre-pass: DeepSeek-V3 special tokens → plain KEY: value
   text = text.replace(
