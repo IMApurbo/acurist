@@ -495,7 +495,10 @@ const TRAILING_SCALAR_PARAMS: Record<string, RegExp> = {
 // `<parameter name="x">` attribute style, and a lone open/close tag sitting
 // on its own line (the model forgot or was cut off before the other half).
 function unwrapStrayToolTags(value: string): string {
-  const TAG = "(?:antml:)?(?:｜DSML｜|\\|\\|DSML\\|\\|)?(parameter|function|invoke|tool_call)";
+  // Kept in sync with DSML_TOKEN below: tolerates one or two bars of either
+  // width on each side of the sentinel, plus an optional space before the
+  // tag name (both observed as degraded real-world variants).
+  const TAG = "(?:antml:)?(?:[｜|]{1,2}DSML[｜|]{1,2}\\s*)?(parameter|function|invoke|tool_call)";
   const openRe  = new RegExp(`^[ \\t]*<${TAG}(?:[=\\s][^>\\n]*)?>[ \\t]*\\r?\\n?`, "i");
   const closeRe = new RegExp(`\\r?\\n?[ \\t]*</${TAG}>[ \\t]*$`, "i");
   let v = value;
@@ -707,7 +710,15 @@ function stripFabricatedContinuation(text: string): string {
 // <...invoke name="...">...</...invoke> blocks with the DSML token made
 // OPTIONAL on every tag, so one pattern covers canonical, ASCII-degraded,
 // and bare-token output alike.
-const DSML_TOKEN = "(?:｜DSML｜|\\|\\|DSML\\|\\|)?";
+// The ｜DSML｜ sentinel itself degrades in more ways than just "ASCII instead
+// of full-width": it's also been observed DOUBLED on each side (｜｜DSML｜｜),
+// and with a literal space inserted between the sentinel and the tag name
+// it's prefixing (e.g. `<｜｜DSML｜｜ invoke name="...">` instead of the glued
+// `<｜DSML｜invoke name="...">`). `[｜|]{1,2}` tolerates one or two bars of
+// either width on each side; the trailing `\s*` absorbs that optional space
+// before the tag name. The whole token stays optional so bare tags (no
+// sentinel at all) still match.
+const DSML_TOKEN = "(?:[｜|]{1,2}DSML[｜|]{1,2}\\s*)?";
 // Leading `[ \t]*` eats indentation before the opening tag (DSML output is
 // typically pretty-printed one tag per line) so the TOOL: line we emit lands
 // at column 0 — parseToolCalls' header regex is anchored to start-of-line.
@@ -729,7 +740,9 @@ const dsmlParamRe = new RegExp(
 // Outer <...tool_calls>/<...function_calls> wrapper — stripped once the
 // invoke blocks inside it have already been converted, same as the plain
 // <｜tool▁calls▁begin｜>/<｜tool▁calls▁end｜> markers lower down.
-const dsmlWrapperRe = new RegExp(`<\\/?${DSML_TOKEN}(?:tool_calls|function_calls)\\s*>`, "gi");
+// "calls" on its own (no tool_/function_ prefix) has also been observed as
+// a degraded wrapper name alongside the degraded sentinel above.
+const dsmlWrapperRe = new RegExp(`<\\/?${DSML_TOKEN}(?:tool_calls|function_calls|calls)\\s*>`, "gi");
 
 function trimDsmlValue(raw: string): string {
   // Canonical DSML puts the value on its own indented line:
