@@ -26,7 +26,9 @@ import {
   isValidHttpUrl,
   BUILTIN_MODEL_MAP,
 } from "../core/config.js";
-import { SLASH_COMMANDS } from "../core/slashCommands.js";
+import { SLASH_COMMANDS, getSlashCommands, resolveSlashSkill } from "../core/slashCommands.js";
+import { handleSkillCommand } from "../core/skillCommand.js";
+import { loadSkills, setSkillsCwd, takeSkillNotices } from "../core/skills.js";
 import { eventToLines, isToggleable } from "./lines.js";
 import {
   mouseEvents, highlightLine, stripAnsi, sliceCols, plainWidth, wordRangeAt, copyToSystemClipboard,
@@ -138,6 +140,21 @@ export default function App({ config }: { config: AgentConfig }) {
     // Track which tool is currently running for the busy-status label
     if (event.kind === "tool_call") setActiveToolName(event.name);
     if (event.kind === "tool_result") setActiveToolName(null);
+  }, []);
+
+  // ── Skills: scan on startup, auto-install any dropped-in .skill files ──
+  useEffect(() => {
+    try {
+      setSkillsCwd(config.cwd);
+      const skills = loadSkills(true);
+      const lines = takeSkillNotices();
+      if (skills.length) {
+        const shown = skills.slice(0, 6).map((x) => "/" + x.name).join(" ");
+        lines.push(`◈ ${skills.length} skill${skills.length > 1 ? "s" : ""} ready: ${shown}${skills.length > 6 ? " …" : ""}  (type / to browse, /skill list for all)`);
+      }
+      if (lines.length) emit({ kind: "system", id: randomUUID(), text: lines.join("\n") });
+    } catch { /* skills are optional */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Auto-hide the todo panel shortly after every item is completed
@@ -269,7 +286,11 @@ export default function App({ config }: { config: AgentConfig }) {
       setMode({ kind: "busy", label: `Thinking (Esc / Ctrl+C to interrupt)${messageQueueRef.current.length > 0 ? ` · ${messageQueueRef.current.length} queued` : ""}` });
 
       try {
-        if (next.startsWith("/")) {
+        const skillCall = resolveSlashSkill(next);
+        if (skillCall) {
+          // /<skill-name> [args] → the model gets the skill's instructions
+          await agentRef.current!.send(skillCall.prompt, controller.signal, skillCall.display);
+        } else if (next.startsWith("/")) {
           // Await so async slash commands (plugin, agent) fully complete
           // before drainQueue sets mode→idle.
           await runSlashRef.current(next);
@@ -306,6 +327,13 @@ export default function App({ config }: { config: AgentConfig }) {
             id: randomUUID(),
             text:
               SLASH_COMMANDS.map((c) => `${c.usage.padEnd(36)} ${c.description}`).join("\n") +
+              (() => {
+                const sk = getSlashCommands().filter((c) => c.isSkill);
+                return sk.length
+                  ? "\n\nSkills (run with /<name> [args]):\n" +
+                    sk.map((c) => `${c.usage.padEnd(36)} ${c.description.replace(/^skill · /, "")}`.slice(0, Math.max(40, columns - 4))).join("\n")
+                  : "\n\nNo skills installed — /skill install <file.skill|SKILL.md|owner/repo>";
+              })() +
               "\n\n" +
               "Esc (while busy)   interrupt the current turn\n" +
               "Ctrl+J             insert a newline without submitting\n" +
@@ -746,6 +774,17 @@ export default function App({ config }: { config: AgentConfig }) {
           break;
         }
 
+        // ── skill ─────────────────────────────────────────────────────────────
+        case "skill": {
+          try {
+            const text = await handleSkillCommand(rest.filter((x) => x !== ""));
+            if (text) emit({ kind: "system", id: randomUUID(), text });
+          } catch (e: any) {
+            emit({ kind: "system", id: randomUUID(), text: `Skill error: ${e?.message ?? e}` });
+          }
+          break;
+        }
+
         // ── agent ─────────────────────────────────────────────────────────────
         case "agent": {
           try {
@@ -773,8 +812,18 @@ export default function App({ config }: { config: AgentConfig }) {
           exit();
           break;
 
-        default:
-          emit({ kind: "system", id: randomUUID(), text: `Unknown command: /${name}. Try /help.` });
+        default: {
+          const q = name.toLowerCase();
+          const near = getSlashCommands()
+            .filter((c) => c.name.includes(q) || (q.length > 2 && q.includes(c.name)))
+            .slice(0, 5)
+            .map((c) => "/" + c.name);
+          emit({
+            kind: "system",
+            id: randomUUID(),
+            text: `Unknown command: /${name}.` + (near.length ? ` Did you mean ${near.join(", ")}?` : "") + ` Try /help or /skill list.`,
+          });
+        }
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -799,15 +848,18 @@ export default function App({ config }: { config: AgentConfig }) {
       setHistory((h) => [...h, text]);
       if (!text.startsWith("/")) appendPersistentHistory(text);
 
-      if (text.startsWith("/")) {
+      // /<skill-name> [args] (or /skill run <name>) goes to the model with the skill's instructions
+      const skillCall = resolveSlashSkill(text);
+      if (!skillCall && text.startsWith("/")) {
         await runSlash(text);
         return;
       }
+      const modelText = skillCall ? skillCall.prompt : text;
 
       // Pre-resolve @url mentions
-      let resolved = text;
+      let resolved = modelText;
       const urlMentionRe = /@(https?:\/\/\S+)/g;
-      const urlMatches = [...text.matchAll(urlMentionRe)];
+      const urlMatches = [...modelText.matchAll(urlMentionRe)];
       if (urlMatches.length) {
         emit({ kind: "system", id: randomUUID(), text: `🌐 Fetching ${urlMatches.length} URL(s)…` });
         for (const m of urlMatches) {
@@ -833,7 +885,7 @@ export default function App({ config }: { config: AgentConfig }) {
       setMode({ kind: "busy", label: "Thinking (Esc / Ctrl+C to interrupt)" });
       processingQueueRef.current = true;
       try {
-        await agentRef.current!.send(resolved, controller.signal);
+        await agentRef.current!.send(resolved, controller.signal, skillCall?.display);
       } catch (e: any) {
         if (e?.name !== "AbortError") {
           emit({ kind: "system", id: randomUUID(), text: `Error: ${e?.message ?? e}` });

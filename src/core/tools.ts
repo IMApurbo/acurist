@@ -8,6 +8,7 @@ import fetch from "node-fetch";
 import type { ProxyClient } from "./proxyClient.js";
 import type { ToolPermissionMap } from "../types.js";
 import { parseTodoString, normalizeTodoArray } from "./todoParse.js";
+import { findSkill, loadSkills, skillToolOutput } from "./skills.js";
 
 const execAsync = promisify(exec);
 
@@ -190,6 +191,18 @@ export const TOOL_SCHEMAS = [
       type: "object",
       properties: { message: { type: "string" } },
       required: ["message"],
+    },
+  },
+  {
+    name: "use_skill",
+    description: "Load an installed skill's full instructions by name (see the Skills list in the system prompt). Call this before starting a task that matches a skill, then follow what it returns.",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Skill name exactly as listed, e.g. frontend-design" },
+        args: { type: "string", description: "Optional arguments / the specific request to apply the skill to" },
+      },
+      required: ["name"],
     },
   },
   {
@@ -956,6 +969,15 @@ export async function executeTool(
       case "notify_user":
         ctx.notify((input.message as string) ?? "");
         return { output: "Notified.", isError: false };
+      case "use_skill": {
+        const wanted = String(input.name ?? "").trim();
+        const skill = findSkill(wanted);
+        if (!skill || !skill.modelInvocable) {
+          const names = loadSkills().filter((x) => x.modelInvocable).map((x) => x.name);
+          return { output: `No skill named "${wanted}". Available: ${names.join(", ") || "none"}`, isError: true };
+        }
+        return { output: skillToolOutput(skill, typeof input.args === "string" ? input.args : ""), isError: false };
+      }
       case "copy_to_clipboard": return { output: await copyToClipboard(input), isError: false };
       default:                  return { output: `Unknown tool: ${name}`,      isError: true };
     }

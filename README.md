@@ -36,6 +36,7 @@ Connect Acurist to any local or remote OpenAI/Anthropic-compatible endpoint (Oll
 - **Extensible via MCP:** Native support for the [Model Context Protocol](https://modelcontextprotocol.io) (MCP) to plug into custom threat intelligence APIs, vulnerability databases, and external tools.
 - **Remote C2 Operations:** Integrates with Telegram to create a secure bridge for remote command execution, monitoring long scans, and receiving real-time finding alerts on the go.
 - **Built-in Agent Personas:** Switch between purpose-built agents with `/agent` — *Hacker* (default pentester), *Bug Hunter*, *CTF Master*, *Red Teamer*, *Malware Analyst*, *Web Developer*, *DevOps Engineer*, and general-purpose *Assistant* — each with its own system prompt, selectable from a picker instead of typing a name from memory.
+- **Skills (`/<skill-name>`):** Any skill — a `SKILL.md` folder, a standalone `SKILL.md`, or a packaged `.skill` file — is callable as `/<skill-name> [args]`, loaded automatically by the model when relevant, and **auto-installed** when you drop a `.skill` file into `~/.acurist/skills/`. Claude Code skills (`.claude/skills`) work as-is.
 
 ---
 
@@ -154,6 +155,24 @@ Acurist supports slash (`/`) commands to adjust environment parameters dynamical
 | `/agent <name>` | Switch the active persona, e.g. `/agent bug-hunter` |
 | `/agent info <name>` | Show an agent's full system prompt |
 | `/exit` | Gracefully exit the application |
+
+### Skills
+
+| Command | Description |
+| --- | --- |
+| `/<skill-name> [args]` | Run any installed skill (shows in the `/` picker; `$ARGUMENTS`, `$1`…`$9`, `${SKILL_DIR}` are filled in) |
+| `/skill list` | List installed skills and where they came from |
+| `/skill install <src>` | Install from a `.skill` file, `SKILL.md`, folder, URL, or GitHub `owner/repo[/path][@ref]` |
+| `/skill remove <name>` | Uninstall a skill |
+| `/skill info <name>` | Show a skill's location, files and instructions |
+| `/skill run <name> [args]` | Same as `/<name>` — also reaches a skill whose name clashes with a built-in command |
+| `/skill reload` | Rescan skill folders |
+
+**Where skills are read from** (first match wins): `./.acurist/skills`, `~/.acurist/skills`, `./.claude/skills`, `~/.claude/skills`, and skills installed by plugins (`/plugin add`).
+
+**Automatic installation:** drop a `.skill` archive into `~/.acurist/skills/` (or `./.acurist/skills/`) and it is extracted on the next prompt or launch. Plugins installed with `/plugin add` extract each of their skills individually, scripts and references included.
+
+**Frontmatter:** `name`, `description` (plain, quoted, or multi-line `>`/`|`), `argument-hint`, `user-invocable: false` (model-only), `disable-model-invocation: true` (slash-only).
 
 ### Model & Proxy Configuration
 

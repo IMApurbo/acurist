@@ -8,6 +8,8 @@ export interface TelegramConfig { token: string; userId: string; autoStart: bool
 export interface Plugin {
   name: string; description: string; version: string; author: string;
   systemPromptAddition: string; tools?: string[]; repo?: string;
+  /** Names of the skills this plugin installed (see skills.ts) */
+  skills?: string[];
   installedAt: string; marketplaceUrl?: string;
 }
 

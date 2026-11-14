@@ -22,6 +22,7 @@
  *   - ESC / /interrupt from Telegram interrupts current agent turn
  */
 
+import { resolveSlashSkill } from "./slashCommands.js";
 import fetch from "node-fetch";
 import { randomUUID } from "node:crypto";
 import type { MutableRefObject } from "react";
@@ -243,7 +244,10 @@ function doStart(
           const controller = new AbortController();
           currentAgentAbort = controller;
           try {
-            await agentRef.current?.send(text, controller.signal);
+            // /<skill-name> [args] works from Telegram too
+            const skillCall = resolveSlashSkill(text);
+            if (skillCall) await agentRef.current?.send(skillCall.prompt, controller.signal, skillCall.display);
+            else await agentRef.current?.send(text, controller.signal);
           } catch (e: any) {
             if (e?.name !== "AbortError") {
               await sendMessage(token, userId, `❌ Error: ${e?.message ?? e}`);

@@ -1,9 +1,12 @@
 import { AGENT_PERSONAS } from "./agent.js";
+import { loadSkills, resolveSkillCall } from "./skills.js";
 
 export interface SlashCommandSpec {
   name: string;
   usage: string;
   description: string;
+  /** True for entries generated from installed skills (not built-in commands) */
+  isSkill?: boolean;
   /** Sub-options shown after the user types "/command " */
   subOptions?: SubOption[];
 }
@@ -87,6 +90,17 @@ export const SLASH_COMMANDS: SlashCommandSpec[] = [
     ],
   },
   {
+    name: "skill",      usage: "/skill <list|install|remove|info|reload>", description: "manage skills — any skill runs as /<skill-name>",
+    subOptions: [
+      { name: "list",    description: "show installed skills" },
+      { name: "install", description: "install a .skill file, SKILL.md, folder, URL or owner/repo", args: "<src>" },
+      { name: "remove",  description: "uninstall a skill",        args: "<name>" },
+      { name: "info",    description: "show a skill's details",   args: "<name>" },
+      { name: "run",     description: "run a skill (same as /<name>)", args: "<name> [args]" },
+      { name: "reload",  description: "rescan skill folders" },
+    ],
+  },
+  {
     name: "agent",      usage: "/agent <name>",                                description: "switch the active agent persona — pick from the list",
     subOptions: [
       ...AGENT_PERSONAS.map((a) => ({ name: a.id, description: a.description })),
@@ -96,3 +110,28 @@ export const SLASH_COMMANDS: SlashCommandSpec[] = [
   },
   { name: "exit",       usage: "/exit",                                         description: "quit" },
 ];
+
+/** Names that always belong to built-in commands (a skill of the same name needs `/skill run <name>`). */
+export const RESERVED_COMMAND_NAMES: ReadonlySet<string> = new Set([...SLASH_COMMANDS.map((c) => c.name), "quit"]);
+
+/** Built-in commands followed by one entry per user-invocable skill. Cheap: skills are cached. */
+export function getSlashCommands(): SlashCommandSpec[] {
+  let skills: ReturnType<typeof loadSkills> = [];
+  try { skills = loadSkills(); } catch { /* skills are optional */ }
+  const extra: SlashCommandSpec[] = skills
+    .filter((s) => s.userInvocable && !RESERVED_COMMAND_NAMES.has(s.name))
+    .map((s) => ({
+      name: s.name,
+      usage: `/${s.name}${s.argumentHint ? " " + s.argumentHint : " [args]"}`,
+      description: `skill · ${s.description || "(no description)"}`,
+      isSkill: true,
+    }));
+  return [...SLASH_COMMANDS, ...extra];
+}
+
+/** If `text` is "/<skill> args", the prompt to send the model plus what to show in the transcript. */
+export function resolveSlashSkill(text: string): { prompt: string; display: string; name: string } | null {
+  if (!text.startsWith("/")) return null;
+  const call = resolveSkillCall(text, RESERVED_COMMAND_NAMES);
+  return call ? { prompt: call.prompt, display: text.trim(), name: call.skill.name } : null;
+}

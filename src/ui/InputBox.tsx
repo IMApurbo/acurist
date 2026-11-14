@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Box, Text, useInput, usePaste, useStdout } from "ink";
 import wrapAnsi from "wrap-ansi";
-import { SLASH_COMMANDS, type SubOption } from "../core/slashCommands.js";
+import { SLASH_COMMANDS, getSlashCommands, type SubOption } from "../core/slashCommands.js";
 import { getPersistentHistory } from "../core/config.js";
 
 // ── @file mentions ──────────────────────────────────────────────────
@@ -246,7 +246,11 @@ export default function InputBox({
   const matches = useMemo(() => {
     if (!value.startsWith("/") || value.includes(" ") || value.includes("\n")) return [];
     const q = value.slice(1).toLowerCase();
-    return SLASH_COMMANDS.filter((c) => c.name.startsWith(q));
+    // Built-ins + installed skills; prefix matches first, then "contains" for skills
+    const all = getSlashCommands();
+    const prefix = all.filter((c) => c.name.startsWith(q));
+    const loose  = q.length >= 2 ? all.filter((c) => c.isSkill && !c.name.startsWith(q) && c.name.includes(q)) : [];
+    return [...prefix, ...loose];
   }, [value]);
 
   /** Level-2: sub-option matches (value is "/cmd subprefix") */
@@ -284,6 +288,12 @@ export default function InputBox({
   // Derived booleans for clarity in the key handler and renderer
   const showingSuggestions = matches.length > 0;
   const showingSubOptions = !showingSuggestions && subMatches.length > 0;
+
+  // With many skills installed the "/" picker must not swallow the screen:
+  // show a sliding window of at most PICKER_MAX rows that follows the selection.
+  const PICKER_MAX = 8;
+  const pickerStart = Math.max(0, Math.min(suggestIndex - Math.floor(PICKER_MAX / 2), matches.length - PICKER_MAX));
+  const pickerRows  = matches.slice(pickerStart, pickerStart + PICKER_MAX);
 
   // Ink puts the terminal into bracketed-paste mode for the lifetime of this
   // hook and hands back the ENTIRE pasted string in one call, no matter how
@@ -404,6 +414,16 @@ export default function InputBox({
         const nextNewline = value.indexOf("\n", cursor);
         setCursor(nextNewline === -1 ? value.length : nextNewline);
         return;
+      }
+
+      // Enter on a partial "/na…" completes the highlighted command/skill (an exact name still submits)
+      if (showingSuggestions && key.return && !key.shift && !key.meta) {
+        const typed = value.slice(1).toLowerCase();
+        if (!matches.some((c) => c.name === typed)) {
+          const next = `/${matches[Math.min(suggestIndex, matches.length - 1)].name} `;
+          replaceValue(next, next.length);
+          return;
+        }
       }
 
       if (key.return) {
@@ -535,7 +555,7 @@ export default function InputBox({
 
   // Report our total rendered height (popovers + bordered input box) so
   // the parent can reserve exactly this many rows for the live area.
-  const slashPanelRows = showingSuggestions && !disabled ? matches.length + 3 : 0;
+  const slashPanelRows = showingSuggestions && !disabled ? pickerRows.length + 3 : 0;
   const subPanelRows   = showingSubOptions   && !disabled ? subMatches.length + 3 : 0;
   const mentionPanelRows = showingFileSuggestions && !disabled ? fileMatches.length + 3 : 0;
   const inputBoxRows = 2 + visualRows.length; // border top + bottom, plus wrapped content rows
@@ -552,14 +572,20 @@ export default function InputBox({
     <Box flexDirection="column" width={columns}>
       {showingSuggestions && !disabled && (
         <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1}>
-          {matches.map((c, i) => (
-            <Text key={c.name} color={i === suggestIndex ? "cyan" : undefined}>
-              {i === suggestIndex ? "❯ " : "  "}
-              <Text bold={i === suggestIndex}>{c.usage}</Text>
-              <Text dimColor>{"  " + c.description}</Text>
-            </Text>
-          ))}
-          <Text dimColor>Tab to complete · ↑↓ to select · Enter to run as typed</Text>
+          {pickerRows.map((c, k) => {
+            const i = pickerStart + k;
+            // keep each row on ONE terminal line so the reserved height stays exact
+            const room = Math.max(8, columns - 10 - c.usage.length);
+            const desc = c.description.length > room ? c.description.slice(0, room - 1) + "…" : c.description;
+            return (
+              <Text key={c.name} color={i === suggestIndex ? "cyan" : undefined}>
+                {i === suggestIndex ? "❯ " : "  "}
+                <Text bold={i === suggestIndex}>{c.usage}</Text>
+                <Text dimColor>{"  " + desc}</Text>
+              </Text>
+            );
+          })}
+          <Text dimColor>Tab/Enter to complete · ↑↓ to select{matches.length > PICKER_MAX ? ` · ${Math.min(suggestIndex, matches.length - 1) + 1}/${matches.length}` : ""}</Text>
         </Box>
       )}
       {showingSubOptions && !disabled && (

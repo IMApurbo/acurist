@@ -3,6 +3,7 @@ import { ProxyClient } from "./proxyClient.js";
 import { TOOL_SCHEMAS, executeTool, type ToolContext } from "./tools.js";
 import { previewOrLogEx } from "./outputLog.js";
 import { buildPluginSystemPrompt, getActivePluginNames } from "./pluginMarket.js";
+import { buildSkillsIndexPrompt, loadSkills, takeSkillNotices } from "./skills.js";
 import {
   loadAllMcpCapabilities,
   buildMcpSystemPrompt,
@@ -221,6 +222,7 @@ Built-in tools
 - update_todos -> Show the current step-by-step plan, one todo per line
 - notify_user -> Send a short notification to the user
 - copy_to_clipboard -> Copy text to the system clipboard
+- use_skill -> Load an installed skill's full instructions by name (see the "Skills" list further down, if present)
 
 Dynamic MCP tools are exposed as mcp__<server>__<tool>
 
@@ -258,9 +260,9 @@ Dynamic MCP tools are exposed as mcp__<server>__<tool>
 ## Asking the user
 - Only call ask_user when you are genuinely blocked and cannot make progress without input.`;
 
-function buildSystem(agentId: string | undefined, mcpCaps: McpCapabilities[], plugins: string): string {
+function buildSystem(agentId: string | undefined, mcpCaps: McpCapabilities[], plugins: string, skills: string): string {
   const persona = getAgentPersona(agentId);
-  return `${persona.prompt}${COMMON_RULES}${buildMcpSystemPrompt(mcpCaps)}${plugins}`;
+  return `${persona.prompt}${COMMON_RULES}${buildMcpSystemPrompt(mcpCaps)}${plugins}${skills}`;
 }
 
 export interface AgentDeps {
@@ -296,8 +298,17 @@ export class Agent {
     return true;
   }
 
-  async send(userText: string, signal?: AbortSignal): Promise<void> {
-    this.deps.emit({ kind: "user", text: userText, id: randomUUID() });
+  /**
+   * `displayText`, when given, is what the transcript shows for the user's turn
+   * (e.g. "/frontend-design landing page") while `userText` — the full skill
+   * instructions — is what the model actually receives.
+   */
+  async send(userText: string, signal?: AbortSignal, displayText?: string): Promise<void> {
+    this.deps.emit({ kind: "user", text: displayText ?? userText, id: randomUUID() });
+
+    // Pick up skills added since the last turn (auto-installs dropped-in .skill files)
+    loadSkills();
+    for (const n of takeSkillNotices()) this.deps.emit({ kind: "system", text: n, id: randomUUID() });
 
     const activePlugins = getActivePluginNames();
     if (activePlugins.length > 0) {
@@ -310,7 +321,7 @@ export class Agent {
     try { mcpCaps = await loadAllMcpCapabilities(); } catch {}
 
     const pluginPrompt = buildPluginSystemPrompt();
-    const system = buildSystem(this.deps.agentId, mcpCaps, pluginPrompt);
+    const system = buildSystem(this.deps.agentId, mcpCaps, pluginPrompt, buildSkillsIndexPrompt());
 
     const ctx: ToolContext = {
       cwd:             this.deps.cwd,
